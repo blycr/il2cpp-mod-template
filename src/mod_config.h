@@ -32,10 +32,10 @@
 #define MOD_MAIN_IMAGE       "Assembly-CSharp.dll"
 
 // ---------------------------------------------------------------- 2. 面板
-#define MOD_PANEL_TITLE      "il2cpp mod"
+#define MOD_PANEL_TITLE      "罗德岛物理法则改写终端 (IL2CPP Mod)"
 #define MOD_TOGGLE_HINT      "INSERT"   // 面板开关热键提示文字（键位在 imgui_overlay.cpp）
-#define MOD_PANEL_W          900.0f     // 首次出现时的窗口尺寸
-#define MOD_PANEL_H          560.0f
+#define MOD_PANEL_W          960.0f     // 首次出现时的窗口尺寸
+#define MOD_PANEL_H          640.0f
 
 // ---------------------------------------------------------------- 3. 日志
 // 主日志落在「模块所在目录」；手动映射时取不到模块路径，会依次降级到

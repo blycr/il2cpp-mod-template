@@ -74,7 +74,7 @@ namespace
         REQ_NONE = 0,
         REQ_DUMP_CLASS,
         REQ_SCAN_ROSTER,          // 立即刷新本局编队干员 & 怪物快照
-        REQ_RESET_SESSION,        // 一键复位本局状态（关全锁 + 选全体 + 恢复 1x 速度 + 刷快照）
+        REQ_RESET_SESSION,        // 一键复位本局状态（关全锁 + 还原规则 + 选全体 + 恢复 1x 速度 + 刷快照）
         REQ_MOD_CARD_COST,        // 手牌 0 费部署 + 刷新 UI
         REQ_MOD_CARD_RESPAWN,     // 秒清手牌再部署冷却
         REQ_MOD_DEPLOY_LIMIT,     // 解除部署人数上限（手牌不占部署数 + 战场上调至 99）
@@ -90,7 +90,18 @@ namespace
         REQ_MOD_ENEMY_UNHARMFUL,  // 场上怪物进蓝门不扣血
         REQ_MOD_ENEMY_KILL,       // 一键秒杀场上匹配怪物
         REQ_SCAN_STAGE_ENEMIES,   // 读取本关可用怪物 ID 列表
-        REQ_SPAWN_ENEMY,          // 在本关动态刷出指定怪物（Worker 拿控制器 -> 主线程生成）
+        REQ_SPAWN_ENEMY,          // 在本关动态刷出指定怪物（主线程生成）
+        // ---- 底层战斗规则粉碎机 & 进阶整活黑科技 ----
+        REQ_TOGGLE_ALL_TERRAIN,   // 全地形违章放置（高台/地面/禁区均可放置，自动避开红门/蓝门/传送门）
+        REQ_TOGGLE_OVERLAP,       // 同格无限叠放干员（Tile.enableOverlap）
+        REQ_TOGGLE_GLOBAL_RANGE,  // 全地图攻击范围（挂载原生 GlobalRange 组件）
+        REQ_TOGGLE_IGNORE_MOTION, // 无视对地/对空判定 + 破隐匿/迷彩
+        REQ_TOGGLE_IMMUNE,        // 泰拉霸体绝缘体（高抵抗 + 免元素损伤 + 持续清控）
+        REQ_MOD_CHAR_TRUE_DMG,    // 因果律真伤（物/法必中 + 100% 双穿）
+        REQ_MOD_CHAR_MEGA_FORCE,  // 大力出奇迹（干员基础推拉力度 = 10）
+        REQ_MOD_CHAR_REFUND,      // 撤退 100% 返还费用
+        REQ_MOD_ENEMY_WEIGHTLESS, // 怪物零重量（MASS_LEVEL = 0）
+        REQ_MOD_ENEMY_REVEAL,     // 照妖镜：立刻清除场上怪物隐匿/迷彩状态
     };
 
     struct Request
@@ -155,15 +166,67 @@ namespace
         bool     life999;
         bool     overload;
         bool     ammoBoosted;
+        bool     trueDmg;
+        bool     megaForce;
+        bool     fullRefund;
         bool     enemySandbag;
         bool     enemyFrozen;
         bool     enemyUnharmful;
+        bool     enemyWeightless;
         int      speedMode;        // 0 = 原生档位, 1 = 自定义 timeScale
         int      speedLevel;       // 0=0.5x, 1=1x, 2=2x, 3=极速
         float    timeScale;
-        uint32_t charAttrMask;     // bit (attrType) = 本局已改过该干员属性
-        uint32_t enemyAttrMask;    // bit (attrType) = 本局已改过该怪物属性
+        uint64_t charAttrMask;     // bit (attrType) = 本局已改过该干员属性 (支持 0..63)
+        uint64_t enemyAttrMask;    // bit (attrType) = 本局已改过该怪物属性
     };
+
+    // ---- 规则改写可逆备份缓存（纯 POD 静态数组，零堆分配/零 STL，切关自动清零，关闭时精确还原）----
+    struct TileBackup
+    {
+        Il2CppObject *tile;
+        Il2CppObject *tileData;
+        int32_t       origBuildableType;
+        uint8_t       origBlockManual;
+        uint8_t       origOverlap;
+    };
+
+    struct CardCondBackup
+    {
+        Il2CppObject *card;
+        int32_t       origBuildType;
+        int32_t       origOrigBuildType;
+        uint8_t       origCheckManual;
+        int32_t       origManualType;
+        uint8_t       origExcludeWalk;
+        uint8_t       origExcludeNoTarget;
+    };
+
+    struct RangeBackup
+    {
+        Il2CppObject *selector;
+        Il2CppObject *origRange;
+    };
+
+    struct MotionBackup
+    {
+        Il2CppObject *selector;
+        int32_t       origOptMotion;
+        uint8_t       origOptIgnoreMotion;
+        uint8_t       origOptAdv;
+        uint8_t       hasAdvFields;
+        int32_t       origAdvMotion;
+        uint8_t       origAdvIgnoreMotion;
+        uint8_t       origAdvForceIgnoreCamo;
+    };
+
+    TileBackup     g_tileBackups[512];
+    int            g_tileBackupCount     = 0;
+    CardCondBackup g_cardCondBackups[128];
+    int            g_cardCondBackupCount = 0;
+    RangeBackup    g_rangeBackups[256];
+    int            g_rangeBackupCount    = 0;
+    MotionBackup   g_motionBackups[256];
+    int            g_motionBackupCount   = 0;
 
     Request       g_req;
     volatile LONG g_dumpPending  = 0;
@@ -185,10 +248,10 @@ namespace
     volatile LONG g_snapLock     = 0;
     volatile LONG g_fbLock       = 0;
 
-    BattleAppliedState g_applied = { false, false, false, false, false, false, false, false, false, 0, 1, 1.0f, 0, 0 };
+    BattleAppliedState g_applied = { false, false, false, false, false, false, false, false, false, false, false, false, false, 0, 1, 1.0f, 0, 0 };
 
     // 反馈横幅 & 最近 8 条操作记录
-    FeedbackEntry g_lastFeedback = { FB_INFO, "", "就绪：进入任意战斗关卡后自动解锁并列出本局编队" };
+    FeedbackEntry g_lastFeedback = { FB_INFO, "", "黑科技终端已就位：随便进个关卡，立刻接管泰拉物理法则！" };
     FeedbackEntry g_fbHist[8];
     int           g_fbHead       = 0;
     int           g_fbCount      = 0;
@@ -205,7 +268,7 @@ namespace
 
     // ---- 1. 我方干员选择与定制 UI 状态 ----
     char  g_selectedCharId[128]   = "";      // 精确目标干员 ID（空 = 全体本局干员；点击干员按钮自动填入，零拼写错误）
-    char  g_selectedCharLabel[128]= "全体编队干员";
+    char  g_selectedCharLabel[128]= "全体罗德岛干员";
     char  g_charSearch[128]       = "";      // 中文/英文模糊筛选词（支持中文输入法直接输入）
     int   g_cardCostDelta         = -99;
     float g_charAtkSpeed          = 500.0f;
@@ -216,17 +279,24 @@ namespace
     float g_charMagicRes          = 80.0f;
     float g_charBlockCnt          = 5.0f;
     float g_charSpRecov           = 30.0f;
+    float g_charTaunt             = 10.0f;
+    float g_charForce             = 10.0f;
     int   g_charAmmoTarget        = 99;
 
-    // 持续自动锁定开关（每 100ms 在 Worker 线程自动维持）
-    volatile LONG g_lockInfAmmo   = 0;
-    volatile LONG g_lockInfSp     = 0;
-    volatile LONG g_lockGodHp     = 0;
-    volatile LONG g_lockBattleDp  = 0;
+    // 持续自动锁定与底层规则改写开关（100% 在 Unity 主线程 Mod_OnMainPump 维护）
+    volatile LONG g_lockInfAmmo      = 0;
+    volatile LONG g_lockInfSp        = 0;
+    volatile LONG g_lockGodHp        = 0;
+    volatile LONG g_lockBattleDp     = 0;
+    volatile LONG g_lockImmune       = 0;
+    volatile LONG g_ruleAllTerrain   = 0;
+    volatile LONG g_ruleOverlap      = 0;
+    volatile LONG g_ruleGlobalRange  = 0;
+    volatile LONG g_ruleIgnoreMotion = 0;
 
     // ---- 2. 敌方怪物定制 & 刷怪 UI 状态 ----
     char  g_enemyFilter[128]      = "";      // 空 = 场上全体敌人；点选上方怪物按钮或输入中文/ID 筛选
-    char  g_enemyLabel[128]       = "全场所有怪物";
+    char  g_enemyLabel[128]       = "全场所有倒霉蛋";
     float g_enemyMaxHp            = 1000000.0f;
     float g_enemyAtk              = 0.0f;
     float g_enemyDef              = 0.0f;
@@ -1153,17 +1223,28 @@ static void ResetPerBattleState(bool clearLocks)
         InterlockedExchange(&g_lockInfSp, 0);
         InterlockedExchange(&g_lockGodHp, 0);
         InterlockedExchange(&g_lockBattleDp, 0);
+        InterlockedExchange(&g_lockImmune, 0);
     }
+    // 规则改写开关与对象指针备份强制随对局清空（绝不把旧场景指针带进下一关！）
+    InterlockedExchange(&g_ruleAllTerrain, 0);
+    InterlockedExchange(&g_ruleOverlap, 0);
+    InterlockedExchange(&g_ruleGlobalRange, 0);
+    InterlockedExchange(&g_ruleIgnoreMotion, 0);
+    g_tileBackupCount     = 0;
+    g_cardCondBackupCount = 0;
+    g_rangeBackupCount    = 0;
+    g_motionBackupCount   = 0;
+
     SpinLock(&g_snapLock);
     memset(&g_applied, 0, sizeof(g_applied));
     g_applied.speedMode  = 0;
     g_applied.speedLevel = 1;
     g_applied.timeScale  = 1.0f;
     g_selectedCharId[0] = 0;
-    CopyStrSafe(g_selectedCharLabel, sizeof(g_selectedCharLabel), "全体编队干员");
+    CopyStrSafe(g_selectedCharLabel, sizeof(g_selectedCharLabel), "全体罗德岛干员");
     g_charSearch[0] = 0;
     g_enemyFilter[0] = 0;
-    CopyStrSafe(g_enemyLabel, sizeof(g_enemyLabel), "全场所有怪物");
+    CopyStrSafe(g_enemyLabel, sizeof(g_enemyLabel), "全场所有倒霉蛋");
     g_spawnEnemyKey[0] = 0;
     g_customTimeScale = 1.0f;
     g_stageCharCount = 0;
@@ -1176,7 +1257,8 @@ static void ResetPerBattleState(bool clearLocks)
 
 static bool HasAnyLockActive()
 {
-    return g_lockInfAmmo || g_lockInfSp || g_lockGodHp || g_lockBattleDp;
+    return g_lockInfAmmo || g_lockInfSp || g_lockGodHp || g_lockBattleDp || g_lockImmune ||
+           g_ruleAllTerrain || g_ruleOverlap || g_ruleGlobalRange || g_ruleIgnoreMotion;
 }
 
 static void RefreshBattleSnapshot();
@@ -1216,12 +1298,12 @@ static void PollBattleSessionGuard()
         ResetPerBattleState(autoClr);
         if (newPhase == PHASE_FINISHED)
             SetFeedback(FB_INFO, hadLocks && autoClr
-                        ? "本场战斗已结算：已安全停锁并重置面板状态（不影响通关结算）"
-                        : "本场战斗已结算：已锁定修改，待下一关重新解锁");
+                        ? "大捷收工！已光速拔掉黑科技电源并重置状态（安全结算零闪退）"
+                        : "战役结算中：物理法则改写器已锁仓，下局再浪！");
         else
             SetFeedback(FB_INFO, hadLocks && autoClr
-                        ? "已返回主界面：已自动停锁并清理本局状态"
-                        : "已返回主界面：Mod 待命中，进关自动解锁");
+                        ? "已撤回罗德岛大厅：全部黑科技已自动休眠归位"
+                        : "已回到基地大厅：改写终端待命中，进关秒解锁");
         if (newPhase == PHASE_LOBBY)
         {
             g_lastBcPtr = nullptr;
@@ -1252,10 +1334,10 @@ static void PollBattleSessionGuard()
             g_lastFrameCnt = frameCnt;
 
             if (autoRep)
-                SetFeedback(FB_WARN, "已进入第 #%ld 局 [%s]（代理指挥录像中）：为防破坏代理轴，已自动关闭所有持续锁定！",
+                SetFeedback(FB_WARN, "第 #%ld 局 [%s] 代理指挥录像中：已自动休眠所有持续锁，防止把完美自律轴改劈叉！",
                             (long)sid, lvlId[0] ? lvlId : "战斗关卡");
             else
-                SetFeedback(FB_OK, "已进入第 #%ld 局 [%s]：战斗定制已解锁，并已自动清理上一局目标与残留状态",
+                SetFeedback(FB_OK, "空投落地！已接管第 #%ld 局 [%s]（旧局状态已清零，物理法则任君拿捏）",
                             (long)sid, lvlId[0] ? lvlId : "战斗关卡");
 
             // 进入新局后立刻拉取一次编队与怪物库（无需等面板打开再等 1.5s）
@@ -1270,7 +1352,8 @@ static void PollBattleSessionGuard()
                 InterlockedExchange(&g_lockInfSp, 0);
                 InterlockedExchange(&g_lockGodHp, 0);
                 InterlockedExchange(&g_lockBattleDp, 0);
-                SetFeedback(FB_WARN, "检测到切换为代理指挥模式：已自动暂停持续锁定，避免影响录像结算");
+                InterlockedExchange(&g_lockImmune, 0);
+                SetFeedback(FB_WARN, "检测到切入代理指挥：已自动暂停全部持续锁，保住你的自律录像！");
             }
         }
     }
@@ -2227,6 +2310,992 @@ static int ApplyEnemyKill(const char *filter, char *lastMatched, int cap)
 }
 
 // ============================================================================
+// 底层战斗规则粉碎机 & 进阶整活引擎（100% Unity 主线程 / 零 GC 停顿 / 可随时还原）
+// ============================================================================
+static void *StructMemberAddr(void *structBase, Il2CppClass *structKlass, const char *memberName)
+{
+    if (!structBase || !structKlass || !memberName) return nullptr;
+    Il2CppApi &api = ir::Api();
+    if (!api.il2cpp_field_get_offset) return nullptr;
+    FieldInfo *f = ArkReflectFindField(structKlass, memberName, nullptr);
+    if (!f) return nullptr;
+    size_t rawOff = api.il2cpp_field_get_offset(f);
+    if (api.il2cpp_class_is_valuetype && api.il2cpp_class_is_valuetype(structKlass))
+    {
+        if (rawOff >= sizeof(Il2CppObject))
+            rawOff -= sizeof(Il2CppObject);
+    }
+    return (char *)structBase + rawOff;
+}
+
+static MethodInfo *FindMethodWalk(Il2CppClass *klass, const char *name, int argsCount)
+{
+    Il2CppApi &api = ir::Api();
+    if (!klass || !name || !api.il2cpp_class_get_method_from_name) return nullptr;
+    Il2CppClass *cur = klass;
+    while (cur)
+    {
+        if (MethodInfo *m = api.il2cpp_class_get_method_from_name(cur, name, argsCount))
+            return m;
+        cur = api.il2cpp_class_get_parent ? api.il2cpp_class_get_parent(cur) : nullptr;
+    }
+    return nullptr;
+}
+
+// 精确查找指定参数类型后缀的非泛型方法（避免误拿 GetComponent<T> / AddComponent<T> 泛型定义崩溃）
+static MethodInfo *FindMethodWithParamType(Il2CppClass *klass, const char *name, int paramCount, const char *paramSuffix)
+{
+    Il2CppApi &api = ir::Api();
+    if (!klass || !name || !api.il2cpp_class_get_methods) return nullptr;
+    Il2CppClass *cur = klass;
+    while (cur)
+    {
+        void *iter = nullptr;
+        while (MethodInfo *m = api.il2cpp_class_get_methods(cur, &iter))
+        {
+            const char *mn = api.il2cpp_method_get_name ? api.il2cpp_method_get_name(m) : nullptr;
+            if (!mn || strcmp(mn, name) != 0) continue;
+            if (api.il2cpp_method_is_generic && api.il2cpp_method_is_generic(m)) continue;
+            MethodInfoHeader *hdr = (MethodInfoHeader *)m;
+            if (!hdr->methodPointer) continue;
+            if (api.il2cpp_method_get_param_count && (int)api.il2cpp_method_get_param_count(m) != paramCount)
+                continue;
+            if (paramCount > 0 && paramSuffix && paramSuffix[0] && api.il2cpp_method_get_param && api.il2cpp_type_get_name)
+            {
+                Il2CppType *pt = api.il2cpp_method_get_param(m, 0);
+                const char *ptn = pt ? api.il2cpp_type_get_name(pt) : nullptr;
+                if (!ptn) continue;
+                size_t len = strlen(ptn), slen = strlen(paramSuffix);
+                if (len < slen || strcmp(ptn + (len - slen), paramSuffix) != 0)
+                    continue;
+            }
+            return m;
+        }
+        cur = api.il2cpp_class_get_parent ? api.il2cpp_class_get_parent(cur) : nullptr;
+    }
+    return nullptr;
+}
+
+static bool IsUnityObjAlive(Il2CppObject *obj)
+{
+    if (!obj) return false;
+    Il2CppApi &api = ir::Api();
+    Il2CppClass *k = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(obj) : obj->klass;
+    if (!k) return false;
+    if (FieldInfo *fPtr = ArkReflectFindField(k, "m_CachedPtr", nullptr))
+    {
+        if (void *a = ArkReflectFieldAddr(fPtr, obj))
+            return (*(void **)a != nullptr);
+    }
+    return true;
+}
+
+static Il2CppObject *GetBattleMapFast(Il2CppObject *bc)
+{
+    Il2CppApi &api = ir::Api();
+    if (const ArkClassEntry *mapCe = ArkReflectFindClass("Torappu.Battle.Map"))
+    {
+        if (mapCe->klass && api.il2cpp_field_static_get_value)
+        {
+            if (FieldInfo *fInst = ArkReflectFindField(mapCe->klass, "s_instance", nullptr))
+            {
+                Il2CppObject *inst = nullptr;
+                api.il2cpp_field_static_get_value(fInst, &inst);
+                if (inst && IsUnityObjAlive(inst)) return inst;
+            }
+        }
+    }
+    if (bc)
+    {
+        Il2CppClass *bk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bc) : bc->klass;
+        if (bk)
+        {
+            if (FieldInfo *fMap = ArkReflectFindField(bk, "_map", nullptr))
+            {
+                Il2CppObject *m = api.il2cpp_field_get_value_object(fMap, bc);
+                if (m && IsUnityObjAlive(m)) return m;
+            }
+            if (MethodInfo *mGetMap = FindMethodWalk(bk, "get_map", 0))
+            {
+                Il2CppException *exc = nullptr;
+                Il2CppObject *m = api.il2cpp_runtime_invoke(mGetMap, bc, nullptr, &exc);
+                if (!exc && m && IsUnityObjAlive(m)) return m;
+            }
+        }
+    }
+    return nullptr;
+}
+
+static int GetMapTilesFast(Il2CppObject *mapObj, Il2CppObject **outTiles, int maxOut)
+{
+    if (!mapObj || !outTiles || maxOut <= 0) return 0;
+    Il2CppApi &api = ir::Api();
+    Il2CppClass *mk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(mapObj) : mapObj->klass;
+    if (!mk) return 0;
+
+    Il2CppObject *tileArr = nullptr;
+    if (MethodInfo *mGetTiles = FindMethodWalk(mk, "get_tiles", 0))
+    {
+        Il2CppException *exc = nullptr;
+        Il2CppObject *ret = api.il2cpp_runtime_invoke(mGetTiles, mapObj, nullptr, &exc);
+        if (!exc && ret) tileArr = ret;
+    }
+    if (!tileArr)
+    {
+        if (FieldInfo *fT2d = ArkReflectFindField(mk, "_tiles", nullptr))
+        {
+            if (Il2CppObject *t2d = api.il2cpp_field_get_value_object(fT2d, mapObj))
+            {
+                Il2CppClass *t2k = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(t2d) : t2d->klass;
+                if (t2k)
+                {
+                    if (FieldInfo *fArr = ArkReflectFindField(t2k, "_tiles", nullptr))
+                        tileArr = api.il2cpp_field_get_value_object(fArr, t2d);
+                }
+            }
+        }
+    }
+    if (!tileArr) return 0;
+
+    int32_t len = *(int32_t *)((char *)tileArr + 0x18);
+    if (len <= 0 || len > 4096) return 0;
+    Il2CppObject **items = (Il2CppObject **)((char *)tileArr + 0x20);
+    int n = 0;
+    for (int32_t i = 0; i < len && n < maxOut; ++i)
+    {
+        if (items[i] && IsUnityObjAlive(items[i]))
+            outTiles[n++] = items[i];
+    }
+    return n;
+}
+
+static bool InvokeBoolGetter(Il2CppObject *obj, Il2CppClass *k, const char *getterName)
+{
+    Il2CppApi &api = ir::Api();
+    if (!obj || !k || !api.il2cpp_runtime_invoke || !api.il2cpp_object_unbox) return false;
+    MethodInfo *m = FindMethodWalk(k, getterName, 0);
+    if (!m) return false;
+    Il2CppException *exc = nullptr;
+    Il2CppObject *ret = api.il2cpp_runtime_invoke(m, obj, nullptr, &exc);
+    if (exc || !ret) return false;
+    uint8_t *b = (uint8_t *)api.il2cpp_object_unbox(ret);
+    return b && (*b != 0);
+}
+
+static bool IsProtectedSpecialTile(Il2CppObject *tile, Il2CppClass *tk)
+{
+    if (!tile || !tk) return true;
+    // 铁律：严禁触碰红门(刷怪口) / 蓝门(防守点) / 传送门，确保波次与通关判定 100% 稳定
+    if (InvokeBoolGetter(tile, tk, "get_isStartPosTile")) return true;
+    if (InvokeBoolGetter(tile, tk, "get_isEndPosTile"))   return true;
+    if (InvokeBoolGetter(tile, tk, "get_isTelTile"))      return true;
+    return false;
+}
+
+static void MarkMapBuildableDirty(Il2CppObject *mapObj)
+{
+    if (!mapObj) return;
+    Il2CppApi &api = ir::Api();
+    Il2CppClass *mk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(mapObj) : mapObj->klass;
+    if (!mk) return;
+    if (MethodInfo *mDirty = FindMethodWalk(mk, "SetBuildableDirty", 1))
+    {
+        uint8_t dirty = 1;
+        void *args[1] = { &dirty };
+        Il2CppException *exc = nullptr;
+        api.il2cpp_runtime_invoke(mDirty, mapObj, args, &exc);
+    }
+}
+
+static TileBackup *FindOrRecordTileBackup(Il2CppObject *tile, Il2CppClass *tk)
+{
+    for (int i = 0; i < g_tileBackupCount; ++i)
+        if (g_tileBackups[i].tile == tile) return &g_tileBackups[i];
+    if (g_tileBackupCount >= 512) return nullptr;
+
+    Il2CppApi &api = ir::Api();
+    FieldInfo *fData = ArkReflectFindField(tk, "m_data", nullptr);
+    Il2CppObject *td = fData ? api.il2cpp_field_get_value_object(fData, tile) : nullptr;
+    int32_t origBType = 0;
+    if (td)
+    {
+        Il2CppClass *tdk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(td) : td->klass;
+        if (tdk)
+        {
+            if (FieldInfo *fBt = ArkReflectFindField(tdk, "buildableType", nullptr))
+                if (void *a = ArkReflectFieldAddr(fBt, td)) origBType = *(int32_t *)a;
+        }
+    }
+
+    uint8_t origBlk = InvokeBoolGetter(tile, tk, "get_blockManuallySpawn") ? 1 : 0;
+    uint8_t origOvl = InvokeBoolGetter(tile, tk, "get_enableOverlap") ? 1 : 0;
+
+    TileBackup *b = &g_tileBackups[g_tileBackupCount++];
+    b->tile              = tile;
+    b->tileData          = td;
+    b->origBuildableType = origBType;
+    b->origBlockManual   = origBlk;
+    b->origOverlap       = origOvl;
+    return b;
+}
+
+static void SetTileBoolProp(Il2CppObject *tile, Il2CppClass *tk, const char *setterName, const char *fieldName, bool val)
+{
+    Il2CppApi &api = ir::Api();
+    if (MethodInfo *mSet = FindMethodWalk(tk, setterName, 1))
+    {
+        uint8_t v = val ? 1 : 0;
+        void *args[1] = { &v };
+        Il2CppException *exc = nullptr;
+        api.il2cpp_runtime_invoke(mSet, tile, args, &exc);
+        if (!exc) return;
+    }
+    if (FieldInfo *f = ArkReflectFindField(tk, fieldName, nullptr))
+        if (void *a = ArkReflectFieldAddr(f, tile)) *(uint8_t *)a = val ? 1 : 0;
+}
+
+static void ApplyRuleAllTerrain(bool enable, int *outTiles, int *outCards)
+{
+    if (outTiles) *outTiles = 0;
+    if (outCards) *outCards = 0;
+    Il2CppApi &api = ir::Api();
+    Il2CppObject *bc = GetBattleControllerFast();
+    Il2CppObject *mapObj = GetBattleMapFast(bc);
+
+    int tHit = 0, cHit = 0;
+    if (enable)
+    {
+        if (mapObj)
+        {
+            Il2CppObject *tiles[512];
+            int tn = GetMapTilesFast(mapObj, tiles, 512);
+            for (int i = 0; i < tn; ++i)
+            {
+                Il2CppObject *tile = tiles[i];
+                Il2CppClass *tk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(tile) : tile->klass;
+                if (!tk || IsProtectedSpecialTile(tile, tk)) continue;
+
+                TileBackup *bk = FindOrRecordTileBackup(tile, tk);
+                if (!bk || !bk->tileData) continue;
+
+                Il2CppClass *tdk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bk->tileData) : bk->tileData->klass;
+                if (tdk)
+                {
+                    if (FieldInfo *fBt = ArkReflectFindField(tdk, "buildableType", nullptr))
+                        if (void *a = ArkReflectFieldAddr(fBt, bk->tileData))
+                            *(int32_t *)a = 3; // BuildableType.ALL
+                }
+                SetTileBoolProp(tile, tk, "set_blockManuallySpawn", "m_blockManuallySpawn", false);
+                ++tHit;
+            }
+        }
+
+        // 同步放宽所有手牌的 BuildCondition（含 m_buildCondition 与 m_originBuildableCondition）
+        Il2CppObject *cards[128];
+        int cn = bc ? GetBattleCardsFast(bc, cards, 128) : 0;
+        for (int i = 0; i < cn; ++i)
+        {
+            Il2CppObject *card = cards[i];
+            if (!card) continue;
+            Il2CppClass *ck = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(card) : card->klass;
+            if (!ck) continue;
+
+            FieldInfo *fCond     = ArkReflectFindField(ck, "m_buildCondition", nullptr);
+            FieldInfo *fOrigCond = ArkReflectFindField(ck, "m_originBuildableCondition", nullptr);
+            if (!fCond && !fOrigCond) continue;
+
+            FieldInfo *fRef = fCond ? fCond : fOrigCond;
+            Il2CppType *ft = api.il2cpp_field_get_type ? api.il2cpp_field_get_type(fRef) : nullptr;
+            Il2CppClass *condK = (ft && api.il2cpp_class_from_type) ? api.il2cpp_class_from_type(ft) : nullptr;
+            if (!condK) continue;
+
+            // 查找或记录备份
+            CardCondBackup *cb = nullptr;
+            for (int k = 0; k < g_cardCondBackupCount; ++k)
+                if (g_cardCondBackups[k].card == card) { cb = &g_cardCondBackups[k]; break; }
+            if (!cb && g_cardCondBackupCount < 128)
+            {
+                cb = &g_cardCondBackups[g_cardCondBackupCount++];
+                memset(cb, 0, sizeof(*cb));
+                cb->card = card;
+                if (fCond)
+                {
+                    if (void *sb = ArkReflectFieldAddr(fCond, card))
+                    {
+                        if (void *p = StructMemberAddr(sb, condK, "buildableType"))              cb->origBuildType      = *(int32_t *)p;
+                        if (void *p = StructMemberAddr(sb, condK, "checkManuallyBuildableType")) cb->origCheckManual    = *(uint8_t *)p;
+                        if (void *p = StructMemberAddr(sb, condK, "manuallyBuildableType"))      cb->origManualType     = *(int32_t *)p;
+                        if (void *p = StructMemberAddr(sb, condK, "_excludeOccupiedByWalkEnemy"))cb->origExcludeWalk    = *(uint8_t *)p;
+                        if (void *p = StructMemberAddr(sb, condK, "excludeNoTargetTile"))        cb->origExcludeNoTarget= *(uint8_t *)p;
+                    }
+                }
+                if (fOrigCond)
+                {
+                    if (void *sb = ArkReflectFieldAddr(fOrigCond, card))
+                        if (void *p = StructMemberAddr(sb, condK, "buildableType")) cb->origOrigBuildType = *(int32_t *)p;
+                }
+            }
+
+            auto relaxCond = [&](FieldInfo *f) {
+                if (!f) return;
+                void *sb = ArkReflectFieldAddr(f, card);
+                if (!sb) return;
+                if (void *p = StructMemberAddr(sb, condK, "buildableType"))               *(int32_t *)p = 3; // ALL
+                if (void *p = StructMemberAddr(sb, condK, "checkManuallyBuildableType"))  *(uint8_t *)p = 0;
+                if (void *p = StructMemberAddr(sb, condK, "manuallyBuildableType"))       *(int32_t *)p = 3;
+                if (void *p = StructMemberAddr(sb, condK, "_excludeOccupiedByWalkEnemy")) *(uint8_t *)p = 0;
+                if (void *p = StructMemberAddr(sb, condK, "excludeNoTargetTile"))         *(uint8_t *)p = 0;
+            };
+            relaxCond(fCond);
+            relaxCond(fOrigCond);
+            ++cHit;
+        }
+        MarkMapBuildableDirty(mapObj);
+    }
+    else
+    {
+        // 关闭时精确还原每个地块的原始可部署类型与手动禁放标记
+        for (int i = 0; i < g_tileBackupCount; ++i)
+        {
+            TileBackup &bk = g_tileBackups[i];
+            if (!bk.tile || !IsUnityObjAlive(bk.tile)) continue;
+            Il2CppClass *tk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bk.tile) : bk.tile->klass;
+            if (bk.tileData)
+            {
+                Il2CppClass *tdk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bk.tileData) : bk.tileData->klass;
+                if (tdk)
+                {
+                    if (FieldInfo *fBt = ArkReflectFindField(tdk, "buildableType", nullptr))
+                        if (void *a = ArkReflectFieldAddr(fBt, bk.tileData))
+                            *(int32_t *)a = bk.origBuildableType;
+                }
+            }
+            if (tk)
+                SetTileBoolProp(bk.tile, tk, "set_blockManuallySpawn", "m_blockManuallySpawn", bk.origBlockManual != 0);
+            ++tHit;
+        }
+        // 还原手牌 BuildCondition
+        for (int i = 0; i < g_cardCondBackupCount; ++i)
+        {
+            CardCondBackup &cb = g_cardCondBackups[i];
+            if (!cb.card) continue;
+            Il2CppClass *ck = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(cb.card) : cb.card->klass;
+            if (!ck) continue;
+            FieldInfo *fCond     = ArkReflectFindField(ck, "m_buildCondition", nullptr);
+            FieldInfo *fOrigCond = ArkReflectFindField(ck, "m_originBuildableCondition", nullptr);
+            FieldInfo *fRef = fCond ? fCond : fOrigCond;
+            if (!fRef) continue;
+            Il2CppType *ft = api.il2cpp_field_get_type ? api.il2cpp_field_get_type(fRef) : nullptr;
+            Il2CppClass *condK = (ft && api.il2cpp_class_from_type) ? api.il2cpp_class_from_type(ft) : nullptr;
+            if (!condK) continue;
+
+            if (fCond)
+            {
+                if (void *sb = ArkReflectFieldAddr(fCond, cb.card))
+                {
+                    if (void *p = StructMemberAddr(sb, condK, "buildableType"))               *(int32_t *)p = cb.origBuildType;
+                    if (void *p = StructMemberAddr(sb, condK, "checkManuallyBuildableType"))  *(uint8_t *)p = cb.origCheckManual;
+                    if (void *p = StructMemberAddr(sb, condK, "manuallyBuildableType"))       *(int32_t *)p = cb.origManualType;
+                    if (void *p = StructMemberAddr(sb, condK, "_excludeOccupiedByWalkEnemy")) *(uint8_t *)p = cb.origExcludeWalk;
+                    if (void *p = StructMemberAddr(sb, condK, "excludeNoTargetTile"))         *(uint8_t *)p = cb.origExcludeNoTarget;
+                }
+            }
+            if (fOrigCond)
+            {
+                if (void *sb = ArkReflectFieldAddr(fOrigCond, cb.card))
+                    if (void *p = StructMemberAddr(sb, condK, "buildableType")) *(int32_t *)p = cb.origOrigBuildType;
+            }
+            ++cHit;
+        }
+        g_cardCondBackupCount = 0;
+        if (InterlockedCompareExchange(&g_ruleOverlap, 0, 0) == 0)
+            g_tileBackupCount = 0;
+        MarkMapBuildableDirty(mapObj);
+    }
+
+    if (outTiles) *outTiles = tHit;
+    if (outCards) *outCards = cHit;
+}
+
+static void ApplyRuleOverlap(bool enable, int *outTiles)
+{
+    if (outTiles) *outTiles = 0;
+    Il2CppApi &api = ir::Api();
+    Il2CppObject *bc = GetBattleControllerFast();
+    Il2CppObject *mapObj = GetBattleMapFast(bc);
+    int tHit = 0;
+
+    if (enable)
+    {
+        if (mapObj)
+        {
+            Il2CppObject *tiles[512];
+            int tn = GetMapTilesFast(mapObj, tiles, 512);
+            for (int i = 0; i < tn; ++i)
+            {
+                Il2CppObject *tile = tiles[i];
+                Il2CppClass *tk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(tile) : tile->klass;
+                if (!tk || IsProtectedSpecialTile(tile, tk)) continue;
+                FindOrRecordTileBackup(tile, tk);
+                SetTileBoolProp(tile, tk, "set_enableOverlap", "m_enableOverlap", true);
+                ++tHit;
+            }
+            MarkMapBuildableDirty(mapObj);
+        }
+    }
+    else
+    {
+        for (int i = 0; i < g_tileBackupCount; ++i)
+        {
+            TileBackup &bk = g_tileBackups[i];
+            if (!bk.tile || !IsUnityObjAlive(bk.tile)) continue;
+            Il2CppClass *tk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bk.tile) : bk.tile->klass;
+            if (tk)
+            {
+                SetTileBoolProp(bk.tile, tk, "set_enableOverlap", "m_enableOverlap", bk.origOverlap != 0);
+                ++tHit;
+            }
+        }
+        if (InterlockedCompareExchange(&g_ruleAllTerrain, 0, 0) == 0)
+            g_tileBackupCount = 0;
+        MarkMapBuildableDirty(mapObj);
+    }
+    if (outTiles) *outTiles = tHit;
+}
+
+// 零 GC 收集干员身上全部 RangeSelector（跳过 BlockedSelector / SelfSelector）
+static int CollectCharRangeSelectors(Il2CppObject *chr, Il2CppClass *ck, Il2CppObject **outSels, int maxOut)
+{
+    if (!chr || !ck || !outSels || maxOut <= 0) return 0;
+    Il2CppApi &api = ir::Api();
+    const ArkClassEntry *rsCe = ArkReflectFindClass("Torappu.Battle.RangeSelector");
+    Il2CppClass *rsKlass = rsCe ? rsCe->klass : nullptr;
+    if (!rsKlass) return 0;
+
+    int found = 0;
+    auto addSel = [&](Il2CppObject *sel) {
+        if (!sel || found >= maxOut || !IsUnityObjAlive(sel)) return;
+        Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(sel) : sel->klass;
+        if (!sk) return;
+        if (api.il2cpp_class_is_assignable_from && !api.il2cpp_class_is_assignable_from(rsKlass, sk))
+            return;
+        const char *sn = api.il2cpp_class_get_name ? api.il2cpp_class_get_name(sk) : nullptr;
+        if (sn && (strstr(sn, "Blocked") || strstr(sn, "Self")))
+            return;
+        for (int i = 0; i < found; ++i)
+            if (outSels[i] == sel) return;
+        outSels[found++] = sel;
+    };
+
+    auto addFromAbility = [&](Il2CppObject *ab) {
+        if (!ab) return;
+        Il2CppClass *ak = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(ab) : ab->klass;
+        if (!ak) return;
+        if (FieldInfo *fSel = ArkReflectFindField(ak, "_selector", nullptr))
+            addSel(api.il2cpp_field_get_value_object(fSel, ab));
+        if (MethodInfo *mGetSel = FindMethodWalk(ak, "get_selector", 0))
+        {
+            Il2CppException *exc = nullptr;
+            Il2CppObject *s = api.il2cpp_runtime_invoke(mGetSel, ab, nullptr, &exc);
+            if (!exc && s) addSel(s);
+        }
+    };
+
+    // 1) Unit.get_attackTrigger() -> SelectorTrigger.m_selector / get_selector()
+    if (MethodInfo *mTrig = FindMethodWalk(ck, "get_attackTrigger", 0))
+    {
+        Il2CppException *exc = nullptr;
+        Il2CppObject *trig = api.il2cpp_runtime_invoke(mTrig, chr, nullptr, &exc);
+        if (!exc && trig)
+        {
+            Il2CppClass *tk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(trig) : trig->klass;
+            if (tk)
+            {
+                if (FieldInfo *fSel = ArkReflectFindField(tk, "m_selector", nullptr))
+                    addSel(api.il2cpp_field_get_value_object(fSel, trig));
+                if (MethodInfo *mGs = FindMethodWalk(tk, "get_selector", 0))
+                {
+                    Il2CppException *e2 = nullptr;
+                    Il2CppObject *s = api.il2cpp_runtime_invoke(mGs, trig, nullptr, &e2);
+                    if (!e2 && s) addSel(s);
+                }
+            }
+        }
+    }
+
+    // 2) Unit.get_attack() -> Ability._selector
+    if (MethodInfo *mAtk = FindMethodWalk(ck, "get_attack", 0))
+    {
+        Il2CppException *exc = nullptr;
+        Il2CppObject *ab = api.il2cpp_runtime_invoke(mAtk, chr, nullptr, &exc);
+        if (!exc && ab) addFromAbility(ab);
+    }
+
+    // 3) Entity.m_cachedAbilities (List<Ability>) -> 各技能/天赋的能力选择器
+    if (FieldInfo *fCached = ArkReflectFindField(ck, "m_cachedAbilities", nullptr))
+    {
+        if (Il2CppObject *abList = api.il2cpp_field_get_value_object(fCached, chr))
+        {
+            Il2CppClass *lk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(abList) : abList->klass;
+            if (lk)
+            {
+                FieldInfo *fItems = ArkReflectFindField(lk, "_items", nullptr);
+                FieldInfo *fSize  = ArkReflectFindField(lk, "_size", nullptr);
+                if (fItems && fSize)
+                {
+                    int32_t sz = 0;
+                    if (void *a = ArkReflectFieldAddr(fSize, abList)) sz = *(int32_t *)a;
+                    if (sz > 0 && sz <= 256)
+                    {
+                        if (Il2CppObject *arr = api.il2cpp_field_get_value_object(fItems, abList))
+                        {
+                            int32_t arrLen = *(int32_t *)((char *)arr + 0x18);
+                            int32_t take = (sz < arrLen) ? sz : arrLen;
+                            if (take > 256) take = 256;
+                            Il2CppObject **abItems = (Il2CppObject **)((char *)arr + 0x20);
+                            for (int i = 0; i < take && found < maxOut; ++i)
+                                addFromAbility(abItems[i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return found;
+}
+
+static void NotifyUnitRangeChanged(Il2CppObject *chr, Il2CppClass *ck)
+{
+    Il2CppApi &api = ir::Api();
+    if (!chr || !ck) return;
+    if (FieldInfo *fDirty = ArkReflectFindField(ck, "m_attackRangeDirty", nullptr))
+        if (void *a = ArkReflectFieldAddr(fDirty, chr)) *(uint8_t *)a = 1;
+    if (MethodInfo *mChg = FindMethodWalk(ck, "OnAttackRangeChanged", 0))
+    {
+        Il2CppException *exc = nullptr;
+        api.il2cpp_runtime_invoke(mChg, chr, nullptr, &exc);
+    }
+}
+
+// 全图攻击范围（挂载真实 Unity 托管 GlobalRange 组件，绝不用 il2cpp_object_new 造假 MonoBehaviour！）
+static void ApplyRuleGlobalRange(bool enable, const char *filter, int *outChars, int *outSels)
+{
+    if (outChars) *outChars = 0;
+    if (outSels)  *outSels  = 0;
+    Il2CppApi &api = ir::Api();
+    Il2CppObject *bc = GetBattleControllerFast();
+    const ArkClassEntry *charCe = ArkReflectFindClass("Torappu.Battle.Character");
+    const ArkClassEntry *grCe   = ArkReflectFindClass("Torappu.Battle.GlobalRange");
+    if (!bc || !charCe || !charCe->klass || !grCe || !grCe->klass) return;
+
+    int cHit = 0, sHit = 0;
+    if (enable)
+    {
+        if (!api.il2cpp_class_get_type || !api.il2cpp_type_get_object || !api.il2cpp_field_set_value_object)
+            return;
+        Il2CppObject *grTypeObj = api.il2cpp_type_get_object(api.il2cpp_class_get_type(grCe->klass));
+        if (!grTypeObj) return;
+
+        Il2CppObject *chars[256];
+        int n = GetBattleCharactersFast(bc, chars, 256);
+        FieldInfo *fData = ArkReflectFindField(charCe->klass, "<data>k__BackingField", nullptr);
+
+        for (int i = 0; i < n; ++i)
+        {
+            Il2CppObject *chr = chars[i];
+            if (!chr || !fData || !IsEntityAlive(chr, charCe->klass)) continue;
+            char desc[128] = { 0 };
+            if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, chr), filter, desc, sizeof(desc)))
+                continue;
+
+            Il2CppObject *sels[32];
+            int sn = CollectCharRangeSelectors(chr, charCe->klass, sels, 32);
+            bool charTouched = false;
+            for (int j = 0; j < sn; ++j)
+            {
+                Il2CppObject *sel = sels[j];
+                Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(sel) : sel->klass;
+                if (!sk) continue;
+                FieldInfo *fRange = ArkReflectFindField(sk, "m_range", nullptr);
+                if (!fRange) continue;
+
+                Il2CppObject *curRange = api.il2cpp_field_get_value_object(fRange, sel);
+                if (curRange)
+                {
+                    Il2CppClass *rk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(curRange) : curRange->klass;
+                    if (rk == grCe->klass && IsUnityObjAlive(curRange))
+                        continue; // 已是全图射程，幂等跳过
+                }
+
+                // 拿 Selector 所在 GameObject，优先复用已有 GlobalRange 组件，否则 AddComponent(typeof(GlobalRange))
+                MethodInfo *mGetGo = FindMethodWalk(sk, "get_gameObject", 0);
+                if (!mGetGo) continue;
+                Il2CppException *exc = nullptr;
+                Il2CppObject *go = api.il2cpp_runtime_invoke(mGetGo, sel, nullptr, &exc);
+                if (exc || !go || !IsUnityObjAlive(go)) continue;
+
+                Il2CppClass *gok = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(go) : go->klass;
+                if (!gok) continue;
+
+                Il2CppObject *grComp = nullptr;
+                if (MethodInfo *mGetComp = FindMethodWithParamType(gok, "GetComponent", 1, "Type"))
+                {
+                    void *args[1] = { grTypeObj };
+                    exc = nullptr;
+                    Il2CppObject *c = api.il2cpp_runtime_invoke(mGetComp, go, args, &exc);
+                    if (!exc && c && IsUnityObjAlive(c)) grComp = c;
+                }
+                if (!grComp)
+                {
+                    if (MethodInfo *mAddComp = FindMethodWithParamType(gok, "AddComponent", 1, "Type"))
+                    {
+                        void *args[1] = { grTypeObj };
+                        exc = nullptr;
+                        Il2CppObject *c = api.il2cpp_runtime_invoke(mAddComp, go, args, &exc);
+                        if (!exc && c && IsUnityObjAlive(c)) grComp = c;
+                    }
+                }
+                if (!grComp) continue;
+
+                // 记录原射程备份（每个 selector 只记录一次原始 m_range）
+                bool alreadyBacked = false;
+                for (int b = 0; b < g_rangeBackupCount; ++b)
+                    if (g_rangeBackups[b].selector == sel) { alreadyBacked = true; break; }
+                if (!alreadyBacked && g_rangeBackupCount < 256)
+                {
+                    g_rangeBackups[g_rangeBackupCount].selector  = sel;
+                    g_rangeBackups[g_rangeBackupCount].origRange = curRange;
+                    ++g_rangeBackupCount;
+                }
+
+                api.il2cpp_field_set_value_object(sel, fRange, grComp);
+                charTouched = true;
+                ++sHit;
+            }
+            if (charTouched)
+            {
+                NotifyUnitRangeChanged(chr, charCe->klass);
+                ++cHit;
+            }
+        }
+    }
+    else
+    {
+        for (int b = 0; b < g_rangeBackupCount; ++b)
+        {
+            RangeBackup &rb = g_rangeBackups[b];
+            if (!rb.selector || !IsUnityObjAlive(rb.selector)) continue;
+            Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(rb.selector) : rb.selector->klass;
+            if (!sk) continue;
+            if (FieldInfo *fRange = ArkReflectFindField(sk, "m_range", nullptr))
+            {
+                if (api.il2cpp_field_set_value_object)
+                    api.il2cpp_field_set_value_object(rb.selector, fRange, rb.origRange);
+                ++sHit;
+            }
+        }
+        g_rangeBackupCount = 0;
+        // 通知场上所有存活干员刷新攻击范围显示
+        Il2CppObject *chars[256];
+        int n = GetBattleCharactersFast(bc, chars, 256);
+        for (int i = 0; i < n; ++i)
+        {
+            if (chars[i] && IsEntityAlive(chars[i], charCe->klass))
+            {
+                NotifyUnitRangeChanged(chars[i], charCe->klass);
+                ++cHit;
+            }
+        }
+    }
+    if (outChars) *outChars = cHit;
+    if (outSels)  *outSels  = sHit;
+}
+
+// 照妖镜：剥离场上敌方怪物的隐匿 (INVISIBLE=9) 与迷彩 (CAMOUFLAGE=17) 状态
+static int ApplyEnemyRevealStealth(const char *filter, char *lastMatched, int cap)
+{
+    Il2CppApi &api = ir::Api();
+    const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Enemy");
+    if (!ce || !ce->klass || !api.il2cpp_runtime_invoke) return 0;
+
+    Il2CppObject *bc = GetBattleControllerFast();
+    Il2CppObject *objs[256];
+    int n = bc ? GetBattleEnemiesFast(bc, objs, 256) : 0;
+    if (n <= 0) return 0;
+
+    MethodInfo *mRemFlag = FindMethodWalk(ce->klass, "RemoveAllBuffsWithCertainAbnormalFlag", 1);
+    if (!mRemFlag) return 0;
+
+    int hit = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        Il2CppObject *enm = objs[i];
+        if (!enm || !IsEntityAlive(enm, ce->klass)) continue;
+        char desc[128] = { 0 };
+        if (!CheckEnemyMatches(enm, ce->klass, filter, desc, sizeof(desc))) continue;
+
+        int32_t flagInv  = 9;  // AbnormalFlag.INVISIBLE
+        int32_t flagCamo = 17; // AbnormalFlag.CAMOUFLAGE
+        void *a1[1] = { &flagInv };
+        void *a2[1] = { &flagCamo };
+        Il2CppException *exc = nullptr;
+        api.il2cpp_runtime_invoke(mRemFlag, enm, a1, &exc);
+        exc = nullptr;
+        api.il2cpp_runtime_invoke(mRemFlag, enm, a2, &exc);
+        CopyStrSafe(lastMatched, cap, desc);
+        ++hit;
+    }
+    return hit;
+}
+
+// 无视对地/对空判定 + 破隐匿/迷彩（铁律：绝不修改 targetSide / targetCategory，确保奶妈不奶怪、输出不打队友）
+static void ApplyRuleIgnoreMotion(bool enable, const char *filter, int *outSels, int *outEnemiesRevealed)
+{
+    if (outSels) *outSels = 0;
+    if (outEnemiesRevealed) *outEnemiesRevealed = 0;
+    Il2CppApi &api = ir::Api();
+    Il2CppObject *bc = GetBattleControllerFast();
+    const ArkClassEntry *charCe = ArkReflectFindClass("Torappu.Battle.Character");
+    if (!bc || !charCe || !charCe->klass) return;
+
+    int sHit = 0;
+    if (enable)
+    {
+        Il2CppObject *chars[256];
+        int n = GetBattleCharactersFast(bc, chars, 256);
+        FieldInfo *fData = ArkReflectFindField(charCe->klass, "<data>k__BackingField", nullptr);
+
+        for (int i = 0; i < n; ++i)
+        {
+            Il2CppObject *chr = chars[i];
+            if (!chr || !fData || !IsEntityAlive(chr, charCe->klass)) continue;
+            char desc[128] = { 0 };
+            if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, chr), filter, desc, sizeof(desc)))
+                continue;
+
+            Il2CppObject *sels[32];
+            int sn = CollectCharRangeSelectors(chr, charCe->klass, sels, 32);
+            for (int j = 0; j < sn; ++j)
+            {
+                Il2CppObject *sel = sels[j];
+                Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(sel) : sel->klass;
+                if (!sk) continue;
+
+                FieldInfo *fOpts    = ArkReflectFindField(sk, "m_targetOptions", nullptr);
+                FieldInfo *fAdvMot  = ArkReflectFindField(sk, "_targetMotion", nullptr);
+                FieldInfo *fAdvIgn  = ArkReflectFindField(sk, "_ignoreMotionMode", nullptr);
+                FieldInfo *fAdvCamo = ArkReflectFindField(sk, "_forceIgnoreCamouflage", nullptr);
+                if (!fOpts && !fAdvMot) continue;
+
+                Il2CppClass *optK = nullptr;
+                void *optBase = nullptr;
+                if (fOpts)
+                {
+                    Il2CppType *ft = api.il2cpp_field_get_type ? api.il2cpp_field_get_type(fOpts) : nullptr;
+                    optK = (ft && api.il2cpp_class_from_type) ? api.il2cpp_class_from_type(ft) : nullptr;
+                    optBase = ArkReflectFieldAddr(fOpts, sel);
+                }
+
+                // 查找或记录原值备份
+                MotionBackup *mb = nullptr;
+                for (int b = 0; b < g_motionBackupCount; ++b)
+                    if (g_motionBackups[b].selector == sel) { mb = &g_motionBackups[b]; break; }
+                if (!mb && g_motionBackupCount < 256)
+                {
+                    mb = &g_motionBackups[g_motionBackupCount++];
+                    memset(mb, 0, sizeof(*mb));
+                    mb->selector = sel;
+                    if (optBase && optK)
+                    {
+                        if (void *p = StructMemberAddr(optBase, optK, "targetMotion"))          mb->origOptMotion       = *(int32_t *)p;
+                        if (void *p = StructMemberAddr(optBase, optK, "ignoreMotionMode"))      mb->origOptIgnoreMotion = *(uint8_t *)p;
+                        if (void *p = StructMemberAddr(optBase, optK, "enableAdvancedOptions")) mb->origOptAdv          = *(uint8_t *)p;
+                    }
+                    if (fAdvMot || fAdvIgn || fAdvCamo)
+                    {
+                        mb->hasAdvFields = 1;
+                        if (fAdvMot)  if (void *a = ArkReflectFieldAddr(fAdvMot, sel))  mb->origAdvMotion          = *(int32_t *)a;
+                        if (fAdvIgn)  if (void *a = ArkReflectFieldAddr(fAdvIgn, sel))  mb->origAdvIgnoreMotion    = *(uint8_t *)a;
+                        if (fAdvCamo) if (void *a = ArkReflectFieldAddr(fAdvCamo, sel)) mb->origAdvForceIgnoreCamo = *(uint8_t *)a;
+                    }
+                }
+
+                // 仅修改地/空与反迷彩字段，绝不碰 targetSide / targetCategory
+                bool changed = false;
+                if (optBase && optK)
+                {
+                    if (void *p = StructMemberAddr(optBase, optK, "targetMotion"))
+                        if (*(int32_t *)p != 3) { *(int32_t *)p = 3; changed = true; } // MotionMask.ALL
+                    if (void *p = StructMemberAddr(optBase, optK, "enableAdvancedOptions"))
+                        if (*(uint8_t *)p != 1) { *(uint8_t *)p = 1; changed = true; }
+                    if (void *p = StructMemberAddr(optBase, optK, "ignoreMotionMode"))
+                        if (*(uint8_t *)p != 1) { *(uint8_t *)p = 1; changed = true; }
+                }
+                if (fAdvMot)
+                    if (void *a = ArkReflectFieldAddr(fAdvMot, sel))
+                        if (*(int32_t *)a != 3) { *(int32_t *)a = 3; changed = true; }
+                if (fAdvIgn)
+                    if (void *a = ArkReflectFieldAddr(fAdvIgn, sel))
+                        if (*(uint8_t *)a != 1) { *(uint8_t *)a = 1; changed = true; }
+                if (fAdvCamo)
+                    if (void *a = ArkReflectFieldAddr(fAdvCamo, sel))
+                        if (*(uint8_t *)a != 1) { *(uint8_t *)a = 1; changed = true; }
+                if (changed) ++sHit;
+            }
+        }
+        char dummy[128] = { 0 };
+        int rev = ApplyEnemyRevealStealth("", dummy, sizeof(dummy));
+        if (outEnemiesRevealed) *outEnemiesRevealed = rev;
+    }
+    else
+    {
+        for (int b = 0; b < g_motionBackupCount; ++b)
+        {
+            MotionBackup &mb = g_motionBackups[b];
+            if (!mb.selector || !IsUnityObjAlive(mb.selector)) continue;
+            Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(mb.selector) : mb.selector->klass;
+            if (!sk) continue;
+            if (FieldInfo *fOpts = ArkReflectFindField(sk, "m_targetOptions", nullptr))
+            {
+                Il2CppType *ft = api.il2cpp_field_get_type ? api.il2cpp_field_get_type(fOpts) : nullptr;
+                Il2CppClass *optK = (ft && api.il2cpp_class_from_type) ? api.il2cpp_class_from_type(ft) : nullptr;
+                void *optBase = ArkReflectFieldAddr(fOpts, mb.selector);
+                if (optBase && optK)
+                {
+                    if (void *p = StructMemberAddr(optBase, optK, "targetMotion"))          *(int32_t *)p = mb.origOptMotion;
+                    if (void *p = StructMemberAddr(optBase, optK, "ignoreMotionMode"))      *(uint8_t *)p = mb.origOptIgnoreMotion;
+                    if (void *p = StructMemberAddr(optBase, optK, "enableAdvancedOptions")) *(uint8_t *)p = mb.origOptAdv;
+                }
+            }
+            if (mb.hasAdvFields)
+            {
+                if (FieldInfo *f = ArkReflectFindField(sk, "_targetMotion", nullptr))
+                    if (void *a = ArkReflectFieldAddr(f, mb.selector)) *(int32_t *)a = mb.origAdvMotion;
+                if (FieldInfo *f = ArkReflectFindField(sk, "_ignoreMotionMode", nullptr))
+                    if (void *a = ArkReflectFieldAddr(f, mb.selector)) *(uint8_t *)a = mb.origAdvIgnoreMotion;
+                if (FieldInfo *f = ArkReflectFindField(sk, "_forceIgnoreCamouflage", nullptr))
+                    if (void *a = ArkReflectFieldAddr(f, mb.selector)) *(uint8_t *)a = mb.origAdvForceIgnoreCamo;
+            }
+            ++sHit;
+        }
+        g_motionBackupCount = 0;
+    }
+    if (outSels) *outSels = sHit;
+}
+
+// 清除单个我方干员身上的常见负面控制异常（眩晕/沉默/冻结/寒冷/束缚/恐惧/麻痹/沉睡）
+static void ClearCharNegativeAbnormals(Il2CppObject *chr, Il2CppClass *ck)
+{
+    Il2CppApi &api = ir::Api();
+    if (!chr || !ck || !api.il2cpp_runtime_invoke) return;
+    MethodInfo *mRem = FindMethodWalk(ck, "RemoveAllBuffsWithCertainAbnormalFlag", 1);
+    if (!mRem) return;
+    static const int32_t kNegFlags[] = { 0, 12, 16, 23, 26, 33, 39, 43 };
+    for (int i = 0; i < 8; ++i)
+    {
+        int32_t f = kNegFlags[i];
+        void *args[1] = { &f };
+        Il2CppException *exc = nullptr;
+        api.il2cpp_runtime_invoke(mRem, chr, args, &exc);
+    }
+}
+
+// 泰拉霸体绝缘体：高异常抗性 + 100% 元素伤害/损伤抗性 + 清除全部负面控制
+static int ApplyCharImmune(const char *filter, bool writeAttrs, char *lastMatched, int cap)
+{
+    int hit = 0;
+    if (writeAttrs)
+    {
+        int sk = 0;
+        hit += ApplyCharacterAttribute(filter, 26 /* ONE_MINUS_STATUS_RESISTANCE */, 0.001f, lastMatched, cap, nullptr, &sk);
+        ApplyCharacterAttribute(filter, 31 /* EP_DAMAGE_RESISTANCE */, 100.0f, lastMatched, cap);
+        ApplyCharacterAttribute(filter, 32 /* EP_RESISTANCE */,        100.0f, lastMatched, cap);
+        if (hit == 0 && sk > 0) hit = sk;
+    }
+
+    Il2CppApi &api = ir::Api();
+    Il2CppObject *bc = GetBattleControllerFast();
+    const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Character");
+    if (!bc || !ce || !ce->klass) return hit;
+
+    Il2CppObject *chars[256];
+    int n = GetBattleCharactersFast(bc, chars, 256);
+    FieldInfo *fData = ArkReflectFindField(ce->klass, "<data>k__BackingField", nullptr);
+    int cleaned = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        Il2CppObject *chr = chars[i];
+        if (!chr || !fData || !IsEntityAlive(chr, ce->klass)) continue;
+        char desc[128] = { 0 };
+        if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, chr), filter, desc, sizeof(desc)))
+            continue;
+        ClearCharNegativeAbnormals(chr, ce->klass);
+        CopyStrSafe(lastMatched, cap, desc);
+        ++cleaned;
+    }
+    return (cleaned > hit) ? cleaned : hit;
+}
+
+// 全额退款不粘锅：撤退 100% 返还费用
+static int ApplyCharFullRefund(const char *filter, char *lastMatched, int cap)
+{
+    Il2CppApi &api = ir::Api();
+    Il2CppObject *bc = GetBattleControllerFast();
+    const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Character");
+    if (!bc || !ce || !ce->klass) return 0;
+
+    Il2CppObject *chars[256];
+    int n = GetBattleCharactersFast(bc, chars, 256);
+    FieldInfo *fData  = ArkReflectFindField(ce->klass, "<data>k__BackingField", nullptr);
+    FieldInfo *fRat1  = ArkReflectFindField(ce->klass, "_withdrawCostRecoverRatio", nullptr);
+    FieldInfo *fRat2  = ArkReflectFindField(ce->klass, "_maxWithdrawCostRatioOfRawCost", nullptr);
+    FieldInfo *fRatM  = ArkReflectFindField(ce->klass, "m_withdrawCostRecoverRatio", nullptr);
+    MethodInfo *mSetR = FindMethodWalk(ce->klass, "SetWithdrawCostRecoverRatio", 3);
+
+    int hit = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        Il2CppObject *chr = chars[i];
+        if (!chr || !fData || !IsEntityAlive(chr, ce->klass)) continue;
+        char desc[128] = { 0 };
+        if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, chr), filter, desc, sizeof(desc)))
+            continue;
+
+        bool needWrite = false;
+        if (fRatM)
+        {
+            if (void *a = ArkReflectFieldAddr(fRatM, chr))
+                if (fabsf(*(float *)a - 1.0f) > 0.01f) { *(float *)a = 1.0f; needWrite = true; }
+        }
+        if (fRat1)
+        {
+            if (void *a = ArkReflectFieldAddr(fRat1, chr))
+                if (fabsf(*(float *)a - 1.0f) > 0.01f) { *(float *)a = 1.0f; needWrite = true; }
+        }
+        if (fRat2)
+        {
+            if (void *a = ArkReflectFieldAddr(fRat2, chr))
+                if (fabsf(*(float *)a - 1.0f) > 0.01f) { *(float *)a = 1.0f; needWrite = true; }
+        }
+        if (mSetR && needWrite)
+        {
+            float ratio = 1.0f;
+            uint8_t isReset = 0;
+            uint8_t limitByDeploy = 0;
+            void *args[3] = { &ratio, &isReset, &limitByDeploy };
+            Il2CppException *exc = nullptr;
+            api.il2cpp_runtime_invoke(mSetR, chr, args, &exc);
+        }
+        if (needWrite)
+        {
+            CopyStrSafe(lastMatched, cap, desc);
+            ++hit;
+        }
+    }
+    return hit;
+}
+
+// ============================================================================
 // 持续自动锁定驱动（100% 运行在 Unity 主线程顶层消息泵 + 幂等跳过已满状态）
 // ============================================================================
 static void PumpPersistentLocks()
@@ -2234,11 +3303,12 @@ static void PumpPersistentLocks()
     if (InterlockedCompareExchange(&g_battlePhase, 0, 0) != PHASE_PLAYING)
         return;
 
-    const bool lockAmmo = InterlockedCompareExchange(&g_lockInfAmmo, 0, 0) != 0;
-    const bool lockSp   = InterlockedCompareExchange(&g_lockInfSp, 0, 0) != 0;
-    const bool lockHp   = InterlockedCompareExchange(&g_lockGodHp, 0, 0) != 0;
+    const bool lockAmmo   = InterlockedCompareExchange(&g_lockInfAmmo, 0, 0) != 0;
+    const bool lockSp     = InterlockedCompareExchange(&g_lockInfSp, 0, 0) != 0;
+    const bool lockHp     = InterlockedCompareExchange(&g_lockGodHp, 0, 0) != 0;
+    const bool lockImmune = InterlockedCompareExchange(&g_lockImmune, 0, 0) != 0;
 
-    if (!lockAmmo && !lockSp && !lockHp)
+    if (!lockAmmo && !lockSp && !lockHp && !lockImmune)
         return;
 
     Il2CppApi &api = ir::Api();
@@ -2325,6 +3395,23 @@ static void PumpPersistentLocks()
                     if (void *a = ArkReflectFieldAddr(fRdy, myCnts[j]))
                         if (*(uint8_t *)a != 0) *(uint8_t *)a = 0;
             }
+        }
+        if (lockImmune)
+        {
+            // 对新部署的干员补写抵抗属性，并持续清空眩晕/冰冻/神经损伤等控制效果
+            if (fAttr)
+            {
+                if (Il2CppObject *attrObj = api.il2cpp_field_get_value_object(fAttr, chr))
+                {
+                    if (ReadAttributeOnObj(attrObj, 26) > 0.01f)
+                        OverwriteAttributeOnObj(attrObj, 26, 0.001f);
+                    if (ReadAttributeOnObj(attrObj, 31) < 99.0f)
+                        OverwriteAttributeOnObj(attrObj, 31, 100.0f);
+                    if (ReadAttributeOnObj(attrObj, 32) < 99.0f)
+                        OverwriteAttributeOnObj(attrObj, 32, 100.0f);
+                }
+            }
+            ClearCharNegativeAbnormals(chr, ce->klass);
         }
     }
 }
@@ -2456,11 +3543,11 @@ static void ExecuteSpawnEnemyOnMainThread(const char *enemyKey, int routeIdx, in
     }
 
     if (spawned > 0)
-        SetFeedback(FB_OK, "已在路线 #%d 刷出 %d/%d 只 \"%s\"%s",
+        SetFeedback(FB_OK, "时空裂缝开启！路线 #%d 凭空空投 %d/%d 只 \"%s\"%s",
                     usedRouteIdx, spawned, total, enemyKey,
-                    applyCustom ? "（已套用自定义属性）" : "");
+                    applyCustom ? "（已顺手魔改属性）" : "");
     else
-        SetFeedback(FB_WARN, "刷怪未生效：\"%s\" 不在本关预加载怪物库中", enemyKey);
+        SetFeedback(FB_WARN, "召唤哑火：\"%s\" 没在本关预加载名单里", enemyKey);
 }
 
 static void ExecuteBattleSpeedOnMainThread(int mode, int speedLevel, float timeScale, bool forceApply = false)
@@ -2472,7 +3559,7 @@ static void ExecuteBattleSpeedOnMainThread(int mode, int speedLevel, float timeS
     if (bc) ReadBattleControllerMeta(bc, &bcState, nullptr, nullptr, 0, nullptr, &bcRes, &loaded);
     if (!bc || bcState != 2 || bcRes != 0 || !loaded)
     {
-        SetFeedback(FB_WARN, "调速已取消：当前战斗已结束或尚未开始");
+        SetFeedback(FB_WARN, "时空扭曲失败：还没开打或已经收工啦");
         return;
     }
 
@@ -2481,12 +3568,12 @@ static void ExecuteBattleSpeedOnMainThread(int mode, int speedLevel, float timeS
     {
         if (mode == 0 && g_applied.speedMode == 0 && g_applied.speedLevel == speedLevel)
         {
-            SetFeedback(FB_INFO, "当前已是该速度档位，无需重复切换");
+            SetFeedback(FB_INFO, "时间流速已是当前档位，咱不瞎折腾");
             return;
         }
         if (mode == 1 && g_applied.speedMode == 1 && fabsf(g_applied.timeScale - timeScale) < 0.02f)
         {
-            SetFeedback(FB_INFO, "当前已是 %.2fx 自定义倍速，无需重复设置", timeScale);
+            SetFeedback(FB_INFO, "当前已是 %.2fx 自定义倍速，无需重复施法", timeScale);
             return;
         }
     }
@@ -2503,17 +3590,17 @@ static void ExecuteBattleSpeedOnMainThread(int mode, int speedLevel, float timeS
             api.il2cpp_runtime_invoke(mSetLvl, bc, args, &exc);
             ok = (exc == nullptr);
         }
-        const char *lvlNames[4] = { "0.5x 慢速", "1x 标准", "2x 加速", "极速 (SUPER_FAST)" };
-        const char *ln = (speedLevel >= 0 && speedLevel < 4) ? lvlNames[speedLevel] : "未知档位";
+        const char *lvlNames[4] = { "子弹时间 (0.5x)", "凡人流速 (1x)", "二倍快进 (2x)", "光速起飞 (3x 极速)" };
+        const char *ln = (speedLevel >= 0 && speedLevel < 4) ? lvlNames[speedLevel] : "神秘档位";
         if (ok)
         {
             g_applied.speedMode  = 0;
             g_applied.speedLevel = speedLevel;
             g_applied.timeScale  = (speedLevel == 0) ? 0.5f : (speedLevel == 1 ? 1.0f : (speedLevel == 2 ? 2.0f : 3.0f));
-            SetFeedback(FB_OK, "战斗速度已切换为：%s", ln);
+            SetFeedback(FB_OK, "时间法则已改写 -> %s", ln);
         }
         else
-            SetFeedback(FB_ERR, "战斗速度档位切换失败（set_speedLevel 异常）");
+            SetFeedback(FB_ERR, "时间法则改写翻车（set_speedLevel 异常）");
     }
     else
     {
@@ -2529,7 +3616,7 @@ static void ExecuteBattleSpeedOnMainThread(int mode, int speedLevel, float timeS
         {
             g_applied.speedMode = 1;
             g_applied.timeScale = timeScale;
-            SetFeedback(FB_OK, "战场时间倍率已设为 %.2fx", timeScale);
+            SetFeedback(FB_OK, "时空曲率已锁定为 %.2fx 倍速！", timeScale);
         }
         else
             SetFeedback(FB_ERR, "自定义时间倍率设置失败");
@@ -2552,11 +3639,11 @@ static void ConsumeBattleRequestOnMainThread()
     if (kind != REQ_SCAN_ROSTER && kind != REQ_RESET_SESSION && curPhase != PHASE_PLAYING)
     {
         if (curPhase == PHASE_LOBBY)
-            SetFeedback(FB_WARN, "操作已拦截：当前在大厅，请进入战斗关卡后再操作");
+            SetFeedback(FB_WARN, "别急！你还在基地大厅摸鱼呢，进关卡才能改写物理法则");
         else if (curPhase == PHASE_LOADING)
-            SetFeedback(FB_WARN, "操作已拦截：关卡加载中，请稍候进入战场后再点");
+            SetFeedback(FB_WARN, "干员还在空投舱里下坠呢，等落地进入战场再按！");
         else
-            SetFeedback(FB_WARN, "操作已拦截：本场战斗已结算，禁止写入状态以防闪退");
+            SetFeedback(FB_WARN, "本局已经大捷收工啦，为了零闪退禁止结算期写入");
         InterlockedIncrement(&g_reqDone);
         return;
     }
@@ -2568,21 +3655,29 @@ static void ConsumeBattleRequestOnMainThread()
         RefreshBattleSnapshot();
         SetFeedback(g_battlePhase == PHASE_PLAYING ? FB_OK : FB_WARN,
                     g_battlePhase == PHASE_PLAYING
-                        ? "已刷新快照：本局编队 %d 名干员 | 场上存活怪物 %d 只 (%d 种)"
-                        : "当前未在战斗中（阶段=%ld），进入关卡后自动加载",
+                        ? "雷达扫描完毕：罗德岛编队 %d 人 | 场上倒霉蛋 %d 只 (%d 种)"
+                        : "当前还没进战场（阶段=%ld），随便开一关立刻自动锁定目标",
                     g_stageCharCount, g_liveEnemyTotal, g_liveEnemyCount, (long)g_battlePhase);
         needRefreshSnap = false;
         break;
 
     case REQ_RESET_SESSION:
     {
+        // 若仍在战斗中，先还原已改写的地形/叠放/射程/地空规则，再清空本地状态
+        if (curPhase == PHASE_PLAYING)
+        {
+            if (InterlockedCompareExchange(&g_ruleAllTerrain, 0, 0) != 0)   ApplyRuleAllTerrain(false, nullptr, nullptr);
+            if (InterlockedCompareExchange(&g_ruleOverlap, 0, 0) != 0)      ApplyRuleOverlap(false, nullptr);
+            if (InterlockedCompareExchange(&g_ruleGlobalRange, 0, 0) != 0)  ApplyRuleGlobalRange(false, "", nullptr, nullptr);
+            if (InterlockedCompareExchange(&g_ruleIgnoreMotion, 0, 0) != 0) ApplyRuleIgnoreMotion(false, "", nullptr, nullptr);
+        }
         ResetPerBattleState(true);
         if (curPhase == PHASE_PLAYING)
         {
             ExecuteBattleSpeedOnMainThread(0, 1, 1.0f, true);
             RefreshBattleSnapshot();
         }
-        SetFeedback(FB_OK, "已一键复位：关闭 4 项锁定 + 清空已生效标记 + 切回全体 + 恢复 1x 速度");
+        SetFeedback(FB_OK, "物理法则大赦天下！全部锁定/违章规则已关闭还原，恢复 1x 凡人模式");
         needRefreshSnap = false;
         break;
     }
@@ -2594,17 +3689,17 @@ static void ConsumeBattleRequestOnMainThread()
         if (cnt > 0)
         {
             g_applied.zeroCost = true;
-            SetFeedback(FB_OK, "已将 %d 张手牌 (%s) 设为 0 费%s",
+            SetFeedback(FB_OK, "白嫖成功！%d 张手牌 (%s) 已设为 0 费空降%s",
                         cnt, matched[0] ? matched : "匹配干员",
-                        skipped > 0 ? "（已自动跳过已是 0 费的手牌）" : "");
+                        skipped > 0 ? "（已是 0 费的自动跳过）" : "");
         }
         else if (skipped > 0)
         {
             g_applied.zeroCost = true;
-            SetFeedback(FB_INFO, "当前目标 %d 张手牌已是 0 费，无需重复修改", skipped);
+            SetFeedback(FB_INFO, "这 %d 张手牌早就是 0 费白嫖价了，无需重复砍价", skipped);
         }
         else
-            SetFeedback(FB_WARN, "本局手牌中未找到匹配 \"%s\" 的干员", g_req.text);
+            SetFeedback(FB_WARN, "手牌里翻了个底朝天也没找到 \"%s\"", g_req.text);
         break;
     }
 
@@ -2616,12 +3711,12 @@ static void ConsumeBattleRequestOnMainThread()
         {
             g_applied.zeroRespawn = true;
             if (cnt > 0)
-                SetFeedback(FB_OK, "已将 %d 张手牌设为 1s 再部署并秒清冷却", cnt);
+                SetFeedback(FB_OK, "医学奇迹！%d 张手牌已开启 1 秒光速诈尸返场并秒清冷却", cnt);
             else
-                SetFeedback(FB_INFO, "目标 %d 张手牌已是极速重下（已顺带秒清当前冷却）", skipped);
+                SetFeedback(FB_INFO, "这 %d 张手牌已是光速重下体质（顺手把当前冷却清零啦）", skipped);
         }
         else
-            SetFeedback(FB_WARN, "未找到匹配 \"%s\" 的手牌", g_req.text);
+            SetFeedback(FB_WARN, "手牌里没找到匹配 \"%s\" 的干员", g_req.text);
         break;
     }
 
@@ -2633,12 +3728,12 @@ static void ConsumeBattleRequestOnMainThread()
         {
             g_applied.deployLimit = true;
             SetFeedback(FB_OK, alreadyBoosted
-                        ? "已补齐 %d 张新增手牌不占部署位（战场 +99 上限已生效，不重复叠加）"
-                        : "已开启无限部署位（%d 张手牌不占人口 + 战场上限 +99）", cnt);
+                        ? "泰拉人口扩容补票：%d 张新手牌不占位置（上限 +99 已生效，防叠加）"
+                        : "泰拉人口大爆炸！%d 张手牌不占部署位 + 战场上限怒加 +99", cnt);
         }
         else
         {
-            SetFeedback(FB_INFO, "无限部署位本局已开启，无需重复叠加");
+            SetFeedback(FB_INFO, "人口上限早就炸到 +99 啦，不用再叠罗汉式加仓");
         }
         break;
     }
@@ -2649,29 +3744,31 @@ static void ConsumeBattleRequestOnMainThread()
         int skipped = 0;
         int cnt = ApplyCharacterAttribute(g_req.text, g_req.attrType, g_req.val, matched, sizeof(matched), &beforeVal, &skipped);
         const char *attrName =
-            (g_req.attrType == 7)  ? "攻击速度" :
+            (g_req.attrType == 7)  ? "攻速" :
             (g_req.attrType == 8)  ? "攻击间隔" :
             (g_req.attrType == 1)  ? "攻击力" :
             (g_req.attrType == 0)  ? "最大生命" :
             (g_req.attrType == 2)  ? "防御力" :
             (g_req.attrType == 3)  ? "法术抗性" :
             (g_req.attrType == 5)  ? "阻挡数" :
-            (g_req.attrType == 14) ? "每秒技力" : "属性";
+            (g_req.attrType == 14) ? "每秒技力" :
+            (g_req.attrType == 20) ? "嘲讽值" :
+            (g_req.attrType == 24) ? "推拉力度" : "神秘属性";
         if (cnt > 0)
         {
-            if (g_req.attrType >= 0 && g_req.attrType < 32)
-                g_applied.charAttrMask |= (1u << g_req.attrType);
-            SetFeedback(FB_OK, "已修改场上 %d 名干员 (%s) %s：%.2f -> %.2f",
+            if (g_req.attrType >= 0 && g_req.attrType < 64)
+                g_applied.charAttrMask |= (1ULL << g_req.attrType);
+            SetFeedback(FB_OK, "神兵锻造完成！%d 名干员 (%s) %s：%.2f -> %.2f",
                         cnt, matched[0] ? matched : "匹配干员", attrName, beforeVal, g_req.val);
         }
         else if (skipped > 0)
         {
-            if (g_req.attrType >= 0 && g_req.attrType < 32)
-                g_applied.charAttrMask |= (1u << g_req.attrType);
-            SetFeedback(FB_INFO, "场上 %d 名匹配干员的%s已是 %.2f，无需重复修改", skipped, attrName, g_req.val);
+            if (g_req.attrType >= 0 && g_req.attrType < 64)
+                g_applied.charAttrMask |= (1ULL << g_req.attrType);
+            SetFeedback(FB_INFO, "场上 %d 名干员的%s早就魔改成 %.2f 啦，无需返工", skipped, attrName, g_req.val);
         }
         else
-            SetFeedback(FB_WARN, "场上暂无已部署的 \"%s\"（已预设到手牌，请先部署上场）",
+            SetFeedback(FB_WARN, "场上还没见着 \"%s\"（已提前灌魔到手牌，下场即巅峰！）",
                         g_req.text[0] ? g_req.text : "我方干员");
         break;
     }
@@ -2680,10 +3777,10 @@ static void ConsumeBattleRequestOnMainThread()
     {
         int cnt = ApplyCharacterFullHpSp(g_req.text, matched, sizeof(matched));
         if (cnt > 0)
-            SetFeedback(FB_OK, "已为场上 %d 名干员 (%s) 瞬间回满生命与技力",
+            SetFeedback(FB_OK, "大圣奶满！场上 %d 名干员 (%s) 瞬间满血满技力原地复活",
                         cnt, matched[0] ? matched : "全体");
         else
-            SetFeedback(FB_WARN, "场上暂无已部署的匹配干员");
+            SetFeedback(FB_WARN, "场上空空如也，先把干员摆上去再奶吧！");
         break;
     }
 
@@ -2697,13 +3794,13 @@ static void ConsumeBattleRequestOnMainThread()
         if (cnt > 0)
         {
             g_applied.ammoBoosted = true;
-            SetFeedback(FB_OK, "弹药已修改：%s %d/%d -> %d/%d（%d 处计数器）",
+            SetFeedback(FB_OK, "无限弹匣扩容成功！%s 子弹 %d/%d -> %d/%d（命中 %d 处）",
                         matched[0] ? matched : "匹配干员", bR, bM, aR, aM, cnt);
         }
         else if (matchedChars == 0)
-            SetFeedback(FB_WARN, "场上暂无已部署的匹配干员（请先部署上场）");
+            SetFeedback(FB_WARN, "场上还没看到目标干员，先请 TA 上台表演！");
         else
-            SetFeedback(FB_WARN, "场上 %d 名匹配干员当前无激活弹药条（仅弹药技开启时生效）", matchedChars);
+            SetFeedback(FB_WARN, "场上 %d 名干员当前没亮弹药条（需先开弹药技能再扩弹匣）", matchedChars);
         break;
     }
 
@@ -2730,13 +3827,13 @@ static void ConsumeBattleRequestOnMainThread()
             g_applied.zeroRespawn  = true;
             g_applied.deployLimit  = true;
             g_applied.overload     = true;
-            g_applied.charAttrMask |= (1u << 0) | (1u << 1) | (1u << 7) | (1u << 8) | (1u << 14);
+            g_applied.charAttrMask |= (1ULL << 0) | (1ULL << 1) | (1ULL << 7) | (1ULL << 8) | (1ULL << 14);
             if (c3 > 0) g_applied.ammoBoosted = true;
-            SetFeedback(FB_OK, "超载机枪已激活：新改手牌=%d | 新改场上=%d | 弹药=%d | DP=99（已强化项自动防重跳过）",
+            SetFeedback(FB_OK, "地爆天星超载机枪已轰鸣！新改手牌=%d | 新改场上=%d | 弹匣=%d | DP=99",
                         c1, c2, c3);
         }
         else
-            SetFeedback(FB_WARN, "超载未命中目标：请确认目标干员已带入本局");
+            SetFeedback(FB_WARN, "超载哑火：请确认目标干员已带进本局编队");
         break;
     }
 
@@ -2745,8 +3842,8 @@ static void ConsumeBattleRequestOnMainThread()
         bool already = false;
         if (ApplyBattleDp((int32_t)g_req.val, &already))
             SetFeedback(already ? FB_INFO : FB_OK, already
-                        ? "当前战场 DP 已达到 %d，无需重复修改"
-                        : "已将战场 DP 设为 %d（上限 999）", (int)g_req.val);
+                        ? "兜里早就揣着 %d 点巨款啦，印钞机歇口气"
+                        : "罗德岛印钞机启动！战场费用飙至 %d（上限 999）", (int)g_req.val);
         else
             SetFeedback(FB_WARN, "未找到 BattleController");
         break;
@@ -2757,8 +3854,8 @@ static void ConsumeBattleRequestOnMainThread()
         bool already = false;
         if (ApplyBattleLifePoint((int32_t)g_req.val, &already))
             SetFeedback(already ? FB_INFO : FB_OK, already
-                        ? "当前蓝门生命已是 %d，无需重复修改"
-                        : "已将战场蓝门生命值设为 %d", (int)g_req.val);
+                        ? "蓝门早就被钛合金焊成 %d 血啦，苍蝇都飞不进去"
+                        : "蓝门已用钛合金焊死！目标生命直冲 %d 点", (int)g_req.val);
         else
             SetFeedback(FB_WARN, "未找到 BattleController");
         break;
@@ -2769,33 +3866,152 @@ static void ConsumeBattleRequestOnMainThread()
         needRefreshSnap = false;
         break;
 
+    case REQ_TOGGLE_ALL_TERRAIN:
+    {
+        bool wantOn = (InterlockedCompareExchange(&g_ruleAllTerrain, 0, 0) == 0);
+        InterlockedExchange(&g_ruleAllTerrain, wantOn ? 1 : 0);
+        int tCnt = 0, cCnt = 0;
+        ApplyRuleAllTerrain(wantOn, &tCnt, &cCnt);
+        if (wantOn)
+            SetFeedback(FB_OK, "违章建筑许可证到手！已放开 %d 块地块 + %d 张手牌（高台/地面/禁区随便放，红蓝门已保护）",
+                        tCnt, cCnt);
+        else
+            SetFeedback(FB_INFO, "违章建筑已拆除！已恢复 %d 块原始地形与 %d 张手牌放置限制", tCnt, cCnt);
+        needRefreshSnap = false;
+        break;
+    }
+
+    case REQ_TOGGLE_OVERLAP:
+    {
+        bool wantOn = (InterlockedCompareExchange(&g_ruleOverlap, 0, 0) == 0);
+        InterlockedExchange(&g_ruleOverlap, wantOn ? 1 : 0);
+        int tCnt = 0;
+        ApplyRuleOverlap(wantOn, &tCnt);
+        if (wantOn)
+            SetFeedback(FB_OK, "千手观音叠罗汉已激活！%d 块地块允许同格无限叠放干员", tCnt);
+        else
+            SetFeedback(FB_INFO, "叠罗汉已解散：%d 块地块恢复单格单人制", tCnt);
+        needRefreshSnap = false;
+        break;
+    }
+
+    case REQ_TOGGLE_GLOBAL_RANGE:
+    {
+        bool wantOn = (InterlockedCompareExchange(&g_ruleGlobalRange, 0, 0) == 0);
+        InterlockedExchange(&g_ruleGlobalRange, wantOn ? 1 : 0);
+        int cCnt = 0, sCnt = 0;
+        ApplyRuleGlobalRange(wantOn, g_selectedCharId, &cCnt, &sCnt);
+        if (wantOn)
+            SetFeedback(FB_OK, cCnt > 0
+                        ? "洲际导弹就位！%d 名干员 (%d 处选择器) 已挂载全图射程（新下干员自动继承）"
+                        : "洲际导弹全图狙已待命：现在下场的干员将自动获得全地图攻击范围！", cCnt, sCnt);
+        else
+            SetFeedback(FB_INFO, "洲际导弹已入库：已为 %d 处选择器恢复原本攻击范围", sCnt);
+        needRefreshSnap = false;
+        break;
+    }
+
+    case REQ_TOGGLE_IGNORE_MOTION:
+    {
+        bool wantOn = (InterlockedCompareExchange(&g_ruleIgnoreMotion, 0, 0) == 0);
+        InterlockedExchange(&g_ruleIgnoreMotion, wantOn ? 1 : 0);
+        int sCnt = 0, revCnt = 0;
+        ApplyRuleIgnoreMotion(wantOn, g_selectedCharId, &sCnt, &revCnt);
+        if (wantOn)
+            SetFeedback(FB_OK, "海陆空通吃照妖已开启！放开 %d 处地空索敌 + 照显 %d 只敌方单位（奶妈仍只奶队友）",
+                        sCnt, revCnt);
+        else
+            SetFeedback(FB_INFO, "海陆空通吃已关闭：已为 %d 处选择器还原原始对地/对空规则", sCnt);
+        needRefreshSnap = false;
+        break;
+    }
+
+    case REQ_TOGGLE_IMMUNE:
+    {
+        bool wantOn = (InterlockedCompareExchange(&g_lockImmune, 0, 0) == 0);
+        InterlockedExchange(&g_lockImmune, wantOn ? 1 : 0);
+        if (wantOn)
+        {
+            int hit = ApplyCharImmune(g_selectedCharId, true, matched, sizeof(matched));
+            g_applied.charAttrMask |= (1ULL << 26) | (1ULL << 31) | (1ULL << 32);
+            SetFeedback(FB_OK, hit > 0
+                        ? "泰拉霸体绝缘体已附体！%d 名干员免控+免元素损伤，晕眩/冰冻/神经损伤统统弹开"
+                        : "泰拉霸体绝缘体已开启（已预设手牌，干员下场立刻百毒不侵！）", hit);
+        }
+        else
+            SetFeedback(FB_INFO, "霸体绝缘体持续清控已关闭（已写入的本局高抵抗仍保留）");
+        needRefreshSnap = false;
+        break;
+    }
+
+    case REQ_MOD_CHAR_TRUE_DMG:
+    {
+        int sk = 0;
+        int c1 = ApplyCharacterAttribute(g_req.text, 33 /* DAMAGE_HITRATE_PHYSICAL */, 1.0f, matched, sizeof(matched), nullptr, &sk);
+        int c2 = ApplyCharacterAttribute(g_req.text, 34 /* DAMAGE_HITRATE_MAGICAL */,  1.0f, matched, sizeof(matched));
+        int c3 = ApplyCharacterAttribute(g_req.text, 17 /* DEF_PENETRATE */,           1.0f, matched, sizeof(matched));
+        int c4 = ApplyCharacterAttribute(g_req.text, 18 /* MAGIC_RESIST_PENETRATE */,  1.0f, matched, sizeof(matched));
+        g_applied.trueDmg = true;
+        g_applied.charAttrMask |= (1ULL << 17) | (1ULL << 18) | (1ULL << 33) | (1ULL << 34);
+        int tot = c1 + c2 + c3 + c4;
+        SetFeedback(FB_OK, tot > 0
+                    ? "因果律必中真伤已觉醒！%s 100%% 命中 + 无视全部物防法抗（闪避/高甲通通蒸发）"
+                    : "目标干员已是因果律真伤完全体（手牌亦同步附魔）",
+                    matched[0] ? matched : g_selectedCharLabel);
+        break;
+    }
+
+    case REQ_MOD_CHAR_MEGA_FORCE:
+    {
+        int sk = 0;
+        int cnt = ApplyCharacterAttribute(g_req.text, 24 /* BASE_FORCE_LEVEL */, g_charForce, matched, sizeof(matched), nullptr, &sk);
+        g_applied.megaForce = true;
+        g_applied.charAttrMask |= (1ULL << 24);
+        SetFeedback(FB_OK, cnt > 0
+                    ? "大力出奇迹！！%d 名干员 (%s) 推拉力度拉满至 %.0f（搭配怪物零重量，一脚踹出银河系！）"
+                    : "目标干员推拉力度已是 %.0f 级神力（手牌亦已注入神力）",
+                    cnt > 0 ? cnt : sk, matched[0] ? matched : g_selectedCharLabel, g_charForce);
+        break;
+    }
+
+    case REQ_MOD_CHAR_REFUND:
+    {
+        int cnt = ApplyCharFullRefund(g_req.text, matched, sizeof(matched));
+        g_applied.fullRefund = true;
+        SetFeedback(FB_OK, cnt > 0
+                    ? "全额退款不粘锅生效！%d 名场上干员撤退 100%% 退全款（后续新下干员自动享七天无理由退款）"
+                    : "撤退 100%% 返费已开启：后续上场的干员撤退一律原价全额退款！", cnt);
+        break;
+    }
+
     case REQ_MOD_ENEMY_ATTR:
     {
         float beforeVal = 0.0f;
         int skipped = 0;
         int cnt = ApplyEnemyAttribute(g_req.text, g_req.attrType, g_req.val, matched, sizeof(matched), &beforeVal, &skipped);
         const char *attrName =
-            (g_req.attrType == 0) ? "血量" :
-            (g_req.attrType == 1) ? "攻击" :
-            (g_req.attrType == 2) ? "防御" :
-            (g_req.attrType == 3) ? "法抗" :
-            (g_req.attrType == 6) ? "移速" :
-            (g_req.attrType == 7) ? "攻速" : "属性";
+            (g_req.attrType == 0)  ? "血量" :
+            (g_req.attrType == 1)  ? "攻击" :
+            (g_req.attrType == 2)  ? "防御" :
+            (g_req.attrType == 3)  ? "法抗" :
+            (g_req.attrType == 6)  ? "移速" :
+            (g_req.attrType == 7)  ? "攻速" :
+            (g_req.attrType == 23) ? "重量" : "属性";
         if (cnt > 0)
         {
-            if (g_req.attrType >= 0 && g_req.attrType < 32)
-                g_applied.enemyAttrMask |= (1u << g_req.attrType);
+            if (g_req.attrType >= 0 && g_req.attrType < 64)
+                g_applied.enemyAttrMask |= (1ULL << g_req.attrType);
             if (g_req.attrType == 6) g_applied.enemyFrozen = (g_req.val <= 0.01f);
-            SetFeedback(FB_OK, "已修改场上 %d 只怪物 (%s) %s：%.2f -> %.2f",
-                        cnt, matched[0] ? matched : "全部敌人", attrName, beforeVal, g_req.val);
+            SetFeedback(FB_OK, "敌方改造成功！%d 只倒霉蛋 (%s) %s：%.2f -> %.2f",
+                        cnt, matched[0] ? matched : "全场敌人", attrName, beforeVal, g_req.val);
         }
         else if (skipped > 0)
         {
             if (g_req.attrType == 6) g_applied.enemyFrozen = (g_req.val <= 0.01f);
-            SetFeedback(FB_INFO, "场上 %d 只匹配怪物的%s已是 %.2f，无需重复修改", skipped, attrName, g_req.val);
+            SetFeedback(FB_INFO, "这 %d 只怪物的%s早就改成了 %.2f，别再补刀啦", skipped, attrName, g_req.val);
         }
         else
-            SetFeedback(FB_WARN, "场上暂无匹配 \"%s\" 的存活怪物", g_req.text[0] ? g_req.text : "全部敌人");
+            SetFeedback(FB_WARN, "场上目前没看见 \"%s\"，等红门放怪再下手！", g_req.text[0] ? g_req.text : "敌人");
         break;
     }
 
@@ -2814,11 +4030,11 @@ static void ConsumeBattleRequestOnMainThread()
             g_applied.enemyFrozen    = true;
             g_applied.enemyUnharmful = true;
             SetFeedback(cnt > 0 ? FB_OK : FB_INFO, cnt > 0
-                        ? "已将 %d 只怪物改造为 100万血/0攻/0防/定身沙包（进蓝门不扣血）"
-                        : "场上 %d 只匹配怪物已是沙包状态，无需重复改造", cnt > 0 ? cnt : sk);
+                        ? "沙包流水线出货！%d 只怪物已沦为 100 万血/0 攻防/罚站木桩（进蓝门不扣血）"
+                        : "这 %d 只倒霉蛋早就是顶级沙包木桩了，尽情殴打吧！", cnt > 0 ? cnt : sk);
         }
         else
-            SetFeedback(FB_WARN, "场上暂无匹配存活怪物");
+            SetFeedback(FB_WARN, "场上还没刷怪，沙包厂暂时停工待料");
         break;
     }
 
@@ -2829,15 +4045,43 @@ static void ConsumeBattleRequestOnMainThread()
         if (cnt > 0)
         {
             g_applied.enemyUnharmful = true;
-            SetFeedback(FB_OK, "已将场上 %d 只怪物设为进蓝门不扣血", cnt);
+            SetFeedback(FB_OK, "发放蓝门观光门票！%d 只怪物现已文明旅游，进蓝门绝不扣血", cnt);
         }
         else if (sk > 0)
         {
             g_applied.enemyUnharmful = true;
-            SetFeedback(FB_INFO, "场上 %d 只匹配怪物均已是不扣血状态", sk);
+            SetFeedback(FB_INFO, "场上 %d 只怪物早就领过文明游客证啦", sk);
         }
         else
-            SetFeedback(FB_WARN, "场上暂无匹配存活怪物");
+            SetFeedback(FB_WARN, "场上暂无存活怪物");
+        break;
+    }
+
+    case REQ_MOD_ENEMY_WEIGHTLESS:
+    {
+        int sk = 0;
+        int cnt = ApplyEnemyAttribute(g_req.text, 23 /* MASS_LEVEL */, 0.0f, matched, sizeof(matched), nullptr, &sk);
+        if (cnt > 0 || sk > 0)
+        {
+            g_applied.enemyWeightless = true;
+            g_applied.enemyAttrMask |= (1ULL << 23);
+            SetFeedback(cnt > 0 ? FB_OK : FB_INFO, cnt > 0
+                        ? "牛顿棺材板按不住了！%d 只怪物已变为 0 重量氢气球（轻轻一推直飞平流层！）"
+                        : "场上 %d 只怪物早就轻如鸿毛（重量=0），快请推拉干员起飞！", cnt > 0 ? cnt : sk);
+        }
+        else
+            SetFeedback(FB_WARN, "场上暂无存活怪物可供抽干重力");
+        break;
+    }
+
+    case REQ_MOD_ENEMY_REVEAL:
+    {
+        int cnt = ApplyEnemyRevealStealth(g_req.text, matched, sizeof(matched));
+        if (cnt > 0)
+            SetFeedback(FB_OK, "全图照妖镜发威！已剥离 %d 只怪物 (%s) 的隐匿与迷彩，无处遁形！",
+                        cnt, matched[0] ? matched : "全场敌人");
+        else
+            SetFeedback(FB_WARN, "场上暂无存活怪物可照");
         break;
     }
 
@@ -2845,9 +4089,9 @@ static void ConsumeBattleRequestOnMainThread()
     {
         int cnt = ApplyEnemyKill(g_req.text, matched, sizeof(matched));
         if (cnt > 0)
-            SetFeedback(FB_OK, "已在 Unity 主线程安全秒杀 %d 只怪物 (%s)", cnt, matched[0] ? matched : "全部敌人");
+            SetFeedback(FB_OK, "灭霸打了个响指！%d 只怪物 (%s) 在主线程安全灰飞烟灭", cnt, matched[0] ? matched : "全场敌人");
         else
-            SetFeedback(FB_WARN, "场上暂无匹配存活怪物");
+            SetFeedback(FB_WARN, "响指落空：场上已经一只活怪都没啦");
         break;
     }
 
@@ -2855,9 +4099,9 @@ static void ConsumeBattleRequestOnMainThread()
     {
         int cnt = ScanStageEnemies();
         if (cnt > 0)
-            SetFeedback(FB_OK, "已读取本关预加载怪物：%d 种（共 %ld 条路线）", cnt, (long)g_stageRouteCount);
+            SetFeedback(FB_OK, "红门花名册已破译：本关共预加载 %d 种怪物（%ld 条行进路线）", cnt, (long)g_stageRouteCount);
         else
-            SetFeedback(FB_WARN, "未读取到本关怪物");
+            SetFeedback(FB_WARN, "未读取到本关怪物名单");
         needRefreshSnap = false;
         break;
     }
@@ -2874,7 +4118,7 @@ static void ConsumeBattleRequestOnMainThread()
         }
         if (!keyToUse || !keyToUse[0])
         {
-            SetFeedback(FB_WARN, "刷怪未生效：请先点选本关可用怪物");
+            SetFeedback(FB_WARN, "召唤失败：请先从花名册里点选一个倒霉蛋");
             break;
         }
         ExecuteSpawnEnemyOnMainThread(keyToUse, g_req.extraInt1, g_req.extraInt2, g_spawnApplyCustom);
@@ -2896,7 +4140,7 @@ static void ConsumeBattleRequestOnMainThread()
 
 void Mod_OnReady()
 {
-    Log("[user] Mod_OnReady —— 初始化战斗定制工作台（主线程安全模式）+ 内置分析工具");
+    Log("[user] Mod_OnReady —— 初始化罗德岛物理法则改写终端（主线程安全模式）+ 博士实验室");
 
     ArkLogInit((HMODULE)ModSelfBase());
     ArkGuardInstall();
@@ -2919,7 +4163,7 @@ void Mod_OnTick()
     {
         Log("[user] dump 请求：%s", g_dumpText);
         ReflectDumpClass(g_dumpText, nullptr, 200);
-        SetFeedback(FB_OK, "已导出类 \"%s\" 结构至 il2cpp_mod.log", g_dumpText);
+        SetFeedback(FB_OK, "已将 \"%s\" 的灵魂结构导出至 il2cpp_mod.log", g_dumpText);
         InterlockedIncrement(&g_reqDone);
     }
 
@@ -2985,15 +4229,27 @@ void Mod_OnMainPump()
     const bool playingNow = (InterlockedCompareExchange(&g_battlePhase, 0, 0) == PHASE_PLAYING);
     ++g_mainTick;
 
-    // ③ 持续自动锁定（全幂等，仅在数值变化时写入，0 跨线程风险）
+    // ③ 持续自动锁定 & 规则增量同步（全幂等，仅对新上场干员/新刷出怪物增量生效，0 卡顿）
     if (playingNow)
     {
         if (InterlockedCompareExchange(&g_lockBattleDp, 0, 0) != 0)
             ApplyBattleDp(99);
         if ((g_mainTick % 2) == 0 &&
-            (g_lockInfAmmo || g_lockInfSp || g_lockGodHp))
+            (g_lockInfAmmo || g_lockInfSp || g_lockGodHp || g_lockImmune))
         {
             PumpPersistentLocks();
+        }
+        if ((g_mainTick % 4) == 0)
+        {
+            if (InterlockedCompareExchange(&g_ruleGlobalRange, 0, 0) != 0)
+                ApplyRuleGlobalRange(true, g_selectedCharId, nullptr, nullptr);
+            if (InterlockedCompareExchange(&g_ruleIgnoreMotion, 0, 0) != 0)
+                ApplyRuleIgnoreMotion(true, g_selectedCharId, nullptr, nullptr);
+            if (g_applied.fullRefund)
+            {
+                char dummy[64];
+                ApplyCharFullRefund(g_selectedCharId, dummy, sizeof(dummy));
+            }
         }
     }
 
@@ -3031,6 +4287,18 @@ static const char *FeedbackPrefix(int level)
     }
 }
 
+static void ItemTip(const char *tip)
+{
+    if (tip && tip[0] && ImGui::IsItemHovered())
+    {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(380.0f);
+        ImGui::TextUnformatted(tip);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
 // ---- 状态高亮按钮辅助（已开启/已生效自动变色，一眼看清当前状态）----
 static bool DrawToggleStateBtn(const char *labelOn, const char *labelOff, bool active, float w = 0.0f, float h = 28.0f)
 {
@@ -3045,6 +4313,26 @@ static bool DrawToggleStateBtn(const char *labelOn, const char *labelOff, bool a
         ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.22f, 0.25f, 0.31f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.29f, 0.33f, 0.41f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.18f, 0.21f, 0.26f, 1.0f));
+    }
+    bool clicked = ImGui::Button(active ? labelOn : labelOff, ImVec2(w, h));
+    ImGui::PopStyleColor(3);
+    return clicked;
+}
+
+// 规则粉碎机专属亮紫/靛蓝高亮按钮（区分「底层规则改写」与普通数值锁定）
+static bool DrawRuleToggleBtn(const char *labelOn, const char *labelOff, bool active, float w = 0.0f, float h = 28.0f)
+{
+    if (active)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.50f, 0.20f, 0.68f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.60f, 0.26f, 0.80f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.40f, 0.15f, 0.56f, 1.0f));
+    }
+    else
+    {
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.25f, 0.23f, 0.35f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.34f, 0.30f, 0.46f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.18f, 0.29f, 1.0f));
     }
     bool clicked = ImGui::Button(active ? labelOn : labelOff, ImVec2(w, h));
     ImGui::PopStyleColor(3);
@@ -3129,51 +4417,54 @@ static void DrawBattleCustomizerTab()
     // ========================================================================
     {
         ImVec4 stCol;
-        char stText[180];
+        char stText[200];
         if (curPhase == PHASE_PLAYING && isAutoReplay)
         {
             stCol = ImVec4(1.00f, 0.60f, 0.20f, 1.0f);
-            _snprintf_s(stText, sizeof(stText), _TRUNCATE, "⚠ 代理录像中 #%ld · %s（持续锁已暂停防翻车）",
+            _snprintf_s(stText, sizeof(stText), _TRUNCATE, "⚠ 代理指挥录像 #%ld · %s（持续锁已自动休眠，防把自律改劈叉）",
                         (long)curSessId, g_curLevelId[0] ? g_curLevelId : "战斗中");
         }
         else if (curPhase == PHASE_PLAYING)
         {
             stCol = ImVec4(0.32f, 0.96f, 0.56f, 1.0f);
-            _snprintf_s(stText, sizeof(stText), _TRUNCATE, "● 战斗中 #%ld · %s（主线程安全 · 零卡顿）",
+            _snprintf_s(stText, sizeof(stText), _TRUNCATE, "● 战场已接管 #%ld · %s（主线程稳如老狗 · 零卡顿）",
                         (long)curSessId, g_curLevelId[0] ? g_curLevelId : "关卡");
         }
         else if (curPhase == PHASE_LOADING)
         {
             stCol = ImVec4(1.00f, 0.85f, 0.35f, 1.0f);
-            CopyStrSafe(stText, sizeof(stText), "○ 关卡加载中... 进场后自动解锁");
+            CopyStrSafe(stText, sizeof(stText), "○ 干员空投下坠中... 落地进场后自动解锁黑科技");
         }
         else if (curPhase == PHASE_FINISHED)
         {
             stCol = ImVec4(0.95f, 0.72f, 0.35f, 1.0f);
-            CopyStrSafe(stText, sizeof(stText), "○ 本局已结算 · 修改已自动停锁（安全防闪退）");
+            CopyStrSafe(stText, sizeof(stText), "○ 战役大捷结算中 · 改写器已安全锁仓（零闪退护体）");
         }
         else
         {
             stCol = ImVec4(0.58f, 0.82f, 1.00f, 1.0f);
-            CopyStrSafe(stText, sizeof(stText), "○ 大厅待命 · 进入任意关卡后自动解锁");
+            CopyStrSafe(stText, sizeof(stText), "○ 基地大厅摸鱼中 · 随便进个关卡立刻接管物理法则");
         }
 
         ImGui::TextColored(stCol, "%s", stText);
         ImGui::SameLine();
-        if (ImGui::SmallButton("刷新"))
+        if (ImGui::SmallButton("雷达刷新"))
             PostRequestEx(REQ_SCAN_ROSTER, "", 0, 0.0f);
+        ItemTip("立刻重扫本局编队干员与场上怪物快照");
         ImGui::SameLine();
-        if (ImGui::SmallButton("一键复位"))
+        if (ImGui::SmallButton("一键归零(复位)"))
             PostRequestEx(REQ_RESET_SESSION, "", 0, 0.0f);
+        ItemTip("关闭全部锁定 + 还原全地形/叠放/全图射程/地空规则 + 恢复 1x 速度 + 切回全体目标");
         ImGui::SameLine();
         bool autoRst = (InterlockedCompareExchange(&g_autoResetNew, 0, 0) != 0);
-        if (ImGui::Checkbox("切关自动清锁", &autoRst))
+        if (ImGui::Checkbox("切关自动撤电(清锁)", &autoRst))
         {
             InterlockedExchange(&g_autoResetNew, autoRst ? 1 : 0);
             SetFeedback(FB_INFO, autoRst
-                        ? "已开启切关/结算自动清锁（防脏状态与结算异常）"
-                        : "已关闭切关自动清锁（结算停写保护与代理保护仍保持）");
+                        ? "已开启切关/结算自动断电清锁（杜绝把脏状态带进下一关）"
+                        : "已关闭切关自动清锁（通关结算保护与代理指挥保护仍坚守岗位）");
         }
+        ItemTip("切关、重开或结算时自动关闭所有持续锁定并清理上一局状态（强烈建议保持勾选）");
     }
 
     // 单行紧凑实时反馈条
@@ -3195,8 +4486,8 @@ static void DrawBattleCustomizerTab()
     ImGui::BeginDisabled(!battleReady);
 
     // ========================================================================
-    // 2. 常用总控台（4x2 对齐状态网格 + 倍速单选高亮 + 一键超载）
-    //    所有开关/已生效功能直接变翠绿/金色高亮，不再需要翻日志猜状态！
+    // 2. 物理法则总控台（4×3 对齐状态矩阵 + 时间法则 + 一键地爆天星超载）
+    //    翠绿 = 锁定/生效中 | 亮紫 = 底层规则粉碎机激活中 | 金色 = 终极超载已激活
     // ========================================================================
     if (ImGui::BeginTable("##QuickDeck", 4, ImGuiTableFlags_SizingStretchSame))
     {
@@ -3205,104 +4496,152 @@ static void DrawBattleCustomizerTab()
         ImGui::TableSetColumnIndex(0);
         {
             bool on = (InterlockedCompareExchange(&g_lockInfAmmo, 0, 0) != 0);
-            if (DrawToggleStateBtn("● 无限弹药 [开]###lk_ammo", "○ 无限弹药###lk_ammo", on, -1.0f, 28.0f))
+            if (DrawToggleStateBtn("● 弹幕永动机 (无限弹药)###lk_ammo", "○ 弹幕永动机 (无限弹药)###lk_ammo", on, -1.0f, 28.0f))
             {
                 InterlockedExchange(&g_lockInfAmmo, on ? 0 : 1);
-                SetFeedback(FB_OK, "「无限弹药锁定」已%s（目标：%s）", on ? "关闭" : "开启", g_selectedCharLabel);
+                SetFeedback(FB_OK, "「弹幕永动机 (无限弹药锁定)」已%s（目标：%s）", on ? "关闭" : "点火", g_selectedCharLabel);
             }
+            ItemTip("持续锁定弹药类干员（如能天使/假日威龙陈/水陈等）的子弹不消耗，射到地老天荒");
         }
         ImGui::TableSetColumnIndex(1);
         {
             bool on = (InterlockedCompareExchange(&g_lockInfSp, 0, 0) != 0);
-            if (DrawToggleStateBtn("● 无限技力 [开]###lk_sp", "○ 无限技力###lk_sp", on, -1.0f, 28.0f))
+            if (DrawToggleStateBtn("● 永动充电宝 (无限技力)###lk_sp", "○ 永动充电宝 (无限技力)###lk_sp", on, -1.0f, 28.0f))
             {
                 InterlockedExchange(&g_lockInfSp, on ? 0 : 1);
-                SetFeedback(FB_OK, "「无限技力锁定」已%s（目标：%s）", on ? "关闭" : "开启", g_selectedCharLabel);
+                SetFeedback(FB_OK, "「永动充电宝 (无限技力锁定)」已%s（目标：%s）", on ? "拔线" : "满充", g_selectedCharLabel);
             }
+            ItemTip("持续把目标干员的技力条顶满，技能随便连发无需等回转");
         }
         ImGui::TableSetColumnIndex(2);
         {
             bool on = (InterlockedCompareExchange(&g_lockGodHp, 0, 0) != 0);
-            if (DrawToggleStateBtn("● 干员无敌 [开]###lk_hp", "○ 干员无敌###lk_hp", on, -1.0f, 28.0f))
+            if (DrawToggleStateBtn("● 金身不坏老赖 (锁血无敌)###lk_hp", "○ 金身不坏老赖 (锁血无敌)###lk_hp", on, -1.0f, 28.0f))
             {
                 InterlockedExchange(&g_lockGodHp, on ? 0 : 1);
-                SetFeedback(FB_OK, "「干员锁血无敌」已%s（目标：%s）", on ? "关闭" : "开启", g_selectedCharLabel);
+                SetFeedback(FB_OK, "「金身不坏老赖 (锁血无敌)」已%s（目标：%s）", on ? "卸甲" : "开盾", g_selectedCharLabel);
             }
+            ItemTip("持续把干员生命值锁死在 100%，站撸 Boss 纹丝不动（不卡血条 UI）");
         }
         ImGui::TableSetColumnIndex(3);
         {
             bool on = (InterlockedCompareExchange(&g_lockBattleDp, 0, 0) != 0);
-            if (DrawToggleStateBtn("● DP 锁 99 [开]###lk_dp", "○ DP 锁 99###lk_dp", on, -1.0f, 28.0f))
+            if (DrawToggleStateBtn("● 印钞机狂转 (DP锁99)###lk_dp", "○ 印钞机狂转 (DP锁99)###lk_dp", on, -1.0f, 28.0f))
             {
                 InterlockedExchange(&g_lockBattleDp, on ? 0 : 1);
-                SetFeedback(FB_OK, "「战场 DP 锁定 99」已%s", on ? "关闭" : "开启");
+                SetFeedback(FB_OK, "「罗德岛印钞机 (DP 锁 99)」已%s", on ? "停机" : "狂印");
             }
+            ItemTip("持续把战场部署费用 DP 维持在 99 点（上限提至 999），先锋干员当场失业");
         }
 
         // Row 2: 4 项战场一键强化（生效即变绿 [✓]，防重复叠加）
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
-        if (DrawAppliedActionBtn("✓ 手牌 0 费###act_cost", "手牌 0 费部署###act_cost", applied.zeroCost, false, -1.0f, 28.0f))
+        if (DrawAppliedActionBtn("✓ 白嫖天降 (手牌0费)###act_cost", "白嫖天降 (手牌0费)###act_cost", applied.zeroCost, false, -1.0f, 28.0f))
             PostRequestEx(REQ_MOD_CARD_COST, g_selectedCharId, 4, (float)g_cardCostDelta);
+        ItemTip("把选定干员（默认全体）的手牌部署费用直接砍到 0 费，开局全员空降");
 
         ImGui::TableSetColumnIndex(1);
-        if (DrawAppliedActionBtn("✓ 0 秒重下###act_resp", "秒清再部署冷却###act_resp", applied.zeroRespawn, false, -1.0f, 28.0f))
+        if (DrawAppliedActionBtn("✓ 诈尸返场 (0秒重下)###act_resp", "诈尸返场 (0秒重下)###act_resp", applied.zeroRespawn, false, -1.0f, 28.0f))
             PostRequestEx(REQ_MOD_CARD_RESPAWN, g_selectedCharId, 21, 1.0f);
+        ItemTip("把再部署时间缩到 1 秒并立刻清空当前复活倒计时，刚撤退就能秒下");
 
         ImGui::TableSetColumnIndex(2);
-        if (DrawAppliedActionBtn("✓ 无限部署位###act_lim", "解除部署上限 +99###act_lim", applied.deployLimit, false, -1.0f, 28.0f))
+        if (DrawAppliedActionBtn("✓ 人口大爆炸 (上限+99)###act_lim", "人口大爆炸 (上限+99)###act_lim", applied.deployLimit, false, -1.0f, 28.0f))
             PostRequestEx(REQ_MOD_DEPLOY_LIMIT, g_selectedCharId, 0, 0.0f);
+        ItemTip("解除本局部署人数限制（手牌不占部署位 + 战场人口上限一次性 +99，防重复叠加）");
 
         ImGui::TableSetColumnIndex(3);
-        if (DrawAppliedActionBtn("✓ 蓝门生命 999###act_lp", "蓝门生命 = 999###act_lp", applied.life999, false, -1.0f, 28.0f))
+        if (DrawAppliedActionBtn("✓ 焊死蓝门 (生命999)###act_lp", "焊死蓝门 (生命999)###act_lp", applied.life999, false, -1.0f, 28.0f))
             PostRequestEx(REQ_MOD_BATTLE_LIFE, "", 0, 999.0f);
+        ItemTip("把我方目标生命点（蓝门血量）直接焊到 999，漏怪漏到手软也不掉星");
+
+        // Row 3: 4 项底层规则粉碎机（亮紫常亮 = 已改写底层物理法则，可随时再点一键还原！）
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        {
+            bool on = (InterlockedCompareExchange(&g_ruleAllTerrain, 0, 0) != 0);
+            if (DrawRuleToggleBtn("★ 违章乱建 (全地形放置)###rl_ter", "○ 违章乱建 (全地形放置)###rl_ter", on, -1.0f, 28.0f))
+                PostRequestEx(REQ_TOGGLE_ALL_TERRAIN, "", 0, 0.0f);
+            ItemTip("放开全图地块放置限制：近战上高台、狙击站地板、禁区/坑洞随便摆（自动保护红门/蓝门/传送门，再点可还原）");
+        }
+        ImGui::TableSetColumnIndex(1);
+        {
+            bool on = (InterlockedCompareExchange(&g_ruleOverlap, 0, 0) != 0);
+            if (DrawRuleToggleBtn("★ 叠罗汉 (同格无限叠放)###rl_ovl", "○ 叠罗汉 (同格无限叠放)###rl_ovl", on, -1.0f, 28.0f))
+                PostRequestEx(REQ_TOGGLE_OVERLAP, "", 0, 0.0f);
+            ItemTip("允许在同一个格子上叠加部署多名干员，把十个大爹塞进一个格子里（再点可还原）");
+        }
+        ImGui::TableSetColumnIndex(2);
+        {
+            bool on = (InterlockedCompareExchange(&g_ruleGlobalRange, 0, 0) != 0);
+            if (DrawRuleToggleBtn("★ 洲际导弹 (全图射程)###rl_rng", "○ 洲际导弹 (全图射程)###rl_rng", on, -1.0f, 28.0f))
+                PostRequestEx(REQ_TOGGLE_GLOBAL_RANGE, g_selectedCharId, 0, 0.0f);
+            ItemTip("为选定干员挂载游戏原生全图射程组件 GlobalRange，普攻与技能指哪打哪（新下干员自动继承，再点可还原原射程）");
+        }
+        ImGui::TableSetColumnIndex(3);
+        {
+            bool on = (InterlockedCompareExchange(&g_ruleIgnoreMotion, 0, 0) != 0);
+            if (DrawRuleToggleBtn("★ 海陆空通吃 (地空+破隐)###rl_mot", "○ 海陆空通吃 (地空+破隐)###rl_mot", on, -1.0f, 28.0f))
+                PostRequestEx(REQ_TOGGLE_IGNORE_MOTION, g_selectedCharId, 0, 0.0f);
+            ItemTip("无视对地/对空目标限制（地面近卫手撕无人机）+ 自动破除敌方隐匿与迷彩（绝不串台：奶妈只奶队友、输出只打敌人）");
+        }
 
         ImGui::EndTable();
     }
 
-    // Row 3: 战斗倍速（单选变色高亮）+ 一键超载机枪模式
+    // Row 4: 时间法则（单选变色高亮）+ 地爆天星一键超载
     {
         ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("倍速:");
+        ImGui::TextDisabled("时间法则:");
         ImGui::SameLine();
-        const char *spdLabels[4] = { "0.5x###sp0", "1x###sp1", "2x###sp2", "极速###sp3" };
+        const char *spdLabels[4] = { "子弹0.5x###sp0", "凡人1x###sp1", "快进2x###sp2", "光速3x###sp3" };
         const float spdVals[4]   = { 0.5f, 1.0f, 2.0f, 3.0f };
+        const char *spdTips[4]   = {
+            "子弹时间 (0.5x 慢速)：极限微操卡轴专用",
+            "凡人流速 (1x 标准速度)：原汁原味",
+            "二倍快进 (2x 原生加速)：日常刷图标准节奏",
+            "光速起飞 (3x 原生 SUPER_FAST 极速档)"
+        };
         for (int s = 0; s < 4; ++s)
         {
             if (s > 0) ImGui::SameLine();
             bool sel = (applied.speedMode == 0 && applied.speedLevel == s);
-            if (DrawToggleStateBtn(spdLabels[s], spdLabels[s], sel, 48.0f, 26.0f))
+            if (DrawToggleStateBtn(spdLabels[s], spdLabels[s], sel, 72.0f, 26.0f))
                 PostRequestEx(REQ_MOD_BATTLE_SPEED, "", 0, spdVals[s], 0, s);
+            ItemTip(spdTips[s]);
         }
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(92.0f);
+        ImGui::SetNextItemWidth(86.0f);
         ImGui::SliderFloat("##customTs", &g_customTimeScale, 0.25f, 6.0f, "%.2fx");
         ImGui::SameLine();
-        if (DrawToggleStateBtn("✓ 自定义###spC", "应用###spC", applied.speedMode == 1, 64.0f, 26.0f))
+        if (DrawToggleStateBtn("✓ 扭曲###spC", "扭曲(应用)###spC", applied.speedMode == 1, 78.0f, 26.0f))
             PostRequestEx(REQ_MOD_BATTLE_SPEED, "", 0, g_customTimeScale, 1, 0);
+        ItemTip("按左侧滑条自定义任意战场时间倍率 (0.25x ~ 6.0x)");
 
         ImGui::SameLine();
-        if (DrawAppliedActionBtn("★ 超载机枪 [已激活 · 点击补刷]###act_ov",
-                                 "★ 一键超载机枪模式 (0费/高攻速/满弹药)###act_ov",
+        if (DrawAppliedActionBtn("★ 地爆天星超载 [已点火·点击补刷]###act_ov",
+                                 "★ 地爆天星超载 (0费/高攻速/满弹药)###act_ov",
                                  applied.overload, true, -1.0f, 26.0f))
             PostRequestEx(REQ_MOD_ANGEL_PRESET, g_selectedCharId, 0, 0.0f);
+        ItemTip("一键连招：0费 + 0秒重下 + 无限人口 + DP99 + 狂飙攻速/低间隔/高攻血/高回转 + 扩满弹匣");
     }
 
     ImGui::Spacing();
 
     // ========================================================================
-    // 3. 按对象分 2 个精简子页（我方干员 & 弹药 | 敌方怪物 & 刷怪）
+    // 3. 按阵营分 2 个精简子页（我方神兵工坊 | 敌方怪物改造厂）
     // ========================================================================
     if (ImGui::BeginTabBar("##BattleSubTabs"))
     {
         // ------------------------------------------------------------
-        // 子页 ①：我方干员 & 弹药精细定制
+        // 子页 ①：罗德岛神兵工坊（我方干员 & 弹药 & 特殊外挂）
         // ------------------------------------------------------------
-        if (ImGui::BeginTabItem("① 我方干员 & 弹药"))
+        if (ImGui::BeginTabItem("① 罗德岛神兵工坊 (我方干员)"))
         {
             // A. 目标干员选择（芯片 + 搜索合并为紧凑一行）
-            ImGui::SetNextItemWidth(200.0f);
-            bool searchEnter = ImGui::InputTextWithHint("##charSearch", "筛选本局干员 (中文名/ID)",
+            ImGui::SetNextItemWidth(210.0f);
+            bool searchEnter = ImGui::InputTextWithHint("##charSearch", "按中文名/ID 筛本局干员",
                                                         g_charSearch, sizeof(g_charSearch),
                                                         ImGuiInputTextFlags_EnterReturnsTrue);
             ImGui::SameLine();
@@ -3311,14 +4650,14 @@ static void DrawBattleCustomizerTab()
                 if (ImGui::SmallButton("清空")) g_charSearch[0] = 0;
                 ImGui::SameLine();
             }
-            ImGui::TextColored(ImVec4(1.0f, 0.90f, 0.45f, 1.0f), "作用目标: %s", g_selectedCharLabel);
+            ImGui::TextColored(ImVec4(1.0f, 0.90f, 0.45f, 1.0f), "当前附魔目标: %s", g_selectedCharLabel);
             if (g_selectedCharId[0])
             {
                 ImGui::SameLine();
-                if (ImGui::SmallButton("切回全体"))
+                if (ImGui::SmallButton("切回全体干员"))
                 {
                     g_selectedCharId[0] = 0;
-                    CopyStrSafe(g_selectedCharLabel, sizeof(g_selectedCharLabel), "全体编队干员");
+                    CopyStrSafe(g_selectedCharLabel, sizeof(g_selectedCharLabel), "全体罗德岛干员");
                 }
             }
 
@@ -3327,11 +4666,11 @@ static void DrawBattleCustomizerTab()
                 bool allSel = (g_selectedCharId[0] == 0);
                 if (allSel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.56f, 0.34f, 1.0f));
                 char allBtn[64];
-                _snprintf_s(allBtn, sizeof(allBtn), _TRUNCATE, "★ 全体 (%d人)###chr_all", localCharCount);
+                _snprintf_s(allBtn, sizeof(allBtn), _TRUNCATE, "★ 全军出击 (%d人)###chr_all", localCharCount);
                 if (ImGui::SmallButton(allBtn))
                 {
                     g_selectedCharId[0] = 0;
-                    CopyStrSafe(g_selectedCharLabel, sizeof(g_selectedCharLabel), "全体编队干员");
+                    CopyStrSafe(g_selectedCharLabel, sizeof(g_selectedCharLabel), "全体罗德岛干员");
                 }
                 if (allSel) ImGui::PopStyleColor();
 
@@ -3380,10 +4719,10 @@ static void DrawBattleCustomizerTab()
                     CopyStrSafe(g_selectedCharId, sizeof(g_selectedCharId), m.id);
                     _snprintf_s(g_selectedCharLabel, sizeof(g_selectedCharLabel), _TRUNCATE,
                                 "%s (%s)", m.nameCn[0] ? m.nameCn : m.id, m.id);
-                    SetFeedback(FB_OK, "已选中本局干员：%s", g_selectedCharLabel);
+                    SetFeedback(FB_OK, "附魔准星已锁定干员：%s", g_selectedCharLabel);
                 }
                 if (g_charSearch[0] && shown == 0 && localCharCount > 0)
-                    ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f), "未在本局编队中找到 \"%s\"", g_charSearch);
+                    ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f), "本局编队里查无此人：\"%s\"", g_charSearch);
             }
 
             // 选中干员实时数值回显条
@@ -3400,15 +4739,15 @@ static void DrawBattleCustomizerTab()
                         ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.70f, 1.0f),
                                            "%s [%s]  费:%d  血:%.0f/%.0f  攻:%.0f  攻速:%.0f  间隔:%.2fs",
                                            sel->nameCn[0] ? sel->nameCn : sel->id,
-                                           sel->deployed ? "场上" : "手牌",
+                                           sel->deployed ? "场上激战" : "手牌待命",
                                            sel->cost, sel->hp, sel->maxHp, sel->atk, sel->atkSpd, sel->baseAtkTime);
                         if (sel->hasAmmo)
                             ImGui::TextColored(ImVec4(1.0f, 0.88f, 0.35f, 1.0f),
-                                               "防:%.0f  法抗:%.0f  阻挡:%.0f  技力:%.1f/%.0f  ★弹药: %d/%d",
+                                               "防:%.0f  法抗:%.0f  阻挡:%.0f  技力:%.1f/%.0f  ★弹匣: %d/%d",
                                                sel->def, sel->magicRes, sel->blockCnt, sel->sp, sel->maxSp,
                                                sel->ammoRem, sel->ammoMax);
                         else
-                            ImGui::TextDisabled("防:%.0f  法抗:%.0f  阻挡:%.0f  技力:%.1f/%.0f  弹药: 无激活弹药条",
+                            ImGui::TextDisabled("防:%.0f  法抗:%.0f  阻挡:%.0f  技力:%.1f/%.0f  弹匣: 当前无激活弹药条",
                                                 sel->def, sel->magicRes, sel->blockCnt, sel->sp, sel->maxSp);
                     }
                     ImGui::EndChild();
@@ -3418,57 +4757,98 @@ static void DrawBattleCustomizerTab()
 
             ImGui::Separator();
 
-            // B. 满血满SP + 弹药直改（紧凑一行）
-            if (ImGui::Button("场上满血+满SP", ImVec2(128.0f, 26.0f)))
+            // B. 4 项干员逆天词条（4列对齐，独立高亮状态）
+            if (ImGui::BeginTable("##CharGodPowers", 4, ImGuiTableFlags_SizingStretchSame))
+            {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                if (DrawAppliedActionBtn("✓ 因果律真伤 (必中+双穿)###cg_td", "因果律真伤 (必中+双穿)###cg_td",
+                                         applied.trueDmg, false, -1.0f, 26.0f))
+                    PostRequestEx(REQ_MOD_CHAR_TRUE_DMG, g_selectedCharId, 0, 0.0f);
+                ItemTip("物理/法术 100% 必中 + 100% 无视防御与法抗，闪避怪与高甲罐头全部当场蒸发");
+
+                ImGui::TableSetColumnIndex(1);
+                {
+                    bool on = (InterlockedCompareExchange(&g_lockImmune, 0, 0) != 0);
+                    if (DrawToggleStateBtn("● 霸体绝缘体 (免控+免元素)###cg_im", "○ 霸体绝缘体 (免控+免元素)###cg_im",
+                                           on, -1.0f, 26.0f))
+                        PostRequestEx(REQ_TOGGLE_IMMUNE, g_selectedCharId, 0, 0.0f);
+                    ItemTip("抵抗拉满 + 100% 免元素损伤 + 持续净化眩晕/冰冻/寒冷/沉默/麻痹/恐惧/沉睡");
+                }
+
+                ImGui::TableSetColumnIndex(2);
+                if (DrawAppliedActionBtn("✓ 大力出奇迹 (推拉+10)###cg_mf", "大力出奇迹 (推拉+10)###cg_mf",
+                                         applied.megaForce, false, -1.0f, 26.0f))
+                    PostRequestEx(REQ_MOD_CHAR_MEGA_FORCE, g_selectedCharId, 24, g_charForce);
+                ItemTip("干员基础推拉力度直冲 +10（搭配敌方页「失重气球」，阿消一水枪能把大爹呲出地图）");
+
+                ImGui::TableSetColumnIndex(3);
+                if (DrawAppliedActionBtn("✓ 全额退款 (撤退100%返费)###cg_rf", "全额退款 (撤退100%返费)###cg_rf",
+                                         applied.fullRefund, false, -1.0f, 26.0f))
+                    PostRequestEx(REQ_MOD_CHAR_REFUND, g_selectedCharId, 0, 1.0f);
+                ItemTip("干员撤退时 100% 退还全部部署费用，真正实现七天无理由白嫖（后续新下干员自动继承）");
+
+                ImGui::EndTable();
+            }
+
+            // C. 瞬间回满 + 弹药直改 + 紧急印钞（紧凑一行）
+            if (ImGui::Button("原地满血满蓝 (回血+满SP)", ImVec2(188.0f, 26.0f)))
                 PostRequestEx(REQ_MOD_CHAR_FULL_HPSP, g_selectedCharId, 0, 0.0f);
+            ItemTip("立刻把场上选定干员的血条和技力条全部奶满");
             ImGui::SameLine();
-            ImGui::SetNextItemWidth(96.0f);
+            ImGui::SetNextItemWidth(90.0f);
             ImGui::InputInt("##ammoVal", &g_charAmmoTarget, 10, 50);
             if (g_charAmmoTarget < 1) g_charAmmoTarget = 1;
             if (g_charAmmoTarget > 9999) g_charAmmoTarget = 9999;
             ImGui::SameLine();
-            if (DrawAppliedActionBtn("✓ 改弹药+上限###am1", "改弹药+上限###am1", applied.ammoBoosted, false, 118.0f, 26.0f))
+            if (DrawAppliedActionBtn("✓ 魔改弹匣 (改弹药+上限)###am1", "魔改弹匣 (改弹药+上限)###am1", applied.ammoBoosted, false, 182.0f, 26.0f))
                 PostRequestEx(REQ_MOD_CHAR_AMMO, g_selectedCharId, 0, (float)g_charAmmoTarget, 1, 0);
+            ItemTip("同时扩容当前激活弹药技的弹匣上限与剩余子弹数");
             ImGui::SameLine();
-            if (ImGui::Button("仅补满弹药", ImVec2(96.0f, 26.0f)))
+            if (ImGui::Button("装弹补满 (仅补弹)", ImVec2(138.0f, 26.0f)))
                 PostRequestEx(REQ_MOD_CHAR_AMMO, g_selectedCharId, 0, (float)g_charAmmoTarget, 0, 0);
             ImGui::SameLine();
-            if (ImGui::Button("DP = 99", ImVec2(76.0f, 26.0f)))
+            if (ImGui::Button("紧急印钞 (DP=99)", ImVec2(136.0f, 26.0f)))
                 PostRequestEx(REQ_MOD_BATTLE_DP, "", 0, 99.0f);
 
             ImGui::Separator();
 
-            // C. 干员实时属性精调表（2列×4行整齐对齐，已修改项按钮自动变绿 [✓]）
+            // D. 干员实时属性精调表（2列×5行整齐对齐，幽默主标题 + 括号正经说明，已修改项按钮变绿 [✓]）
             if (ImGui::BeginTable("##CharAttrGrid", 2, ImGuiTableFlags_SizingStretchSame))
             {
                 auto drawCharAttrCell = [&](const char *title, const char *idTag, float *val,
-                                            float step, float stepFast, const char *fmt, int attrType) {
-                    ImGui::SetNextItemWidth(105.0f);
+                                            float step, float stepFast, const char *fmt, int attrType, const char *tip) {
+                    ImGui::SetNextItemWidth(110.0f);
                     ImGui::InputFloat(idTag, val, step, stepFast, fmt);
                     ImGui::SameLine();
-                    bool done = (applied.charAttrMask & (1u << attrType)) != 0;
-                    char bDone[64], bIdle[64];
+                    bool done = (attrType >= 0 && attrType < 64) && ((applied.charAttrMask & (1ULL << attrType)) != 0);
+                    char bDone[96], bIdle[96];
                     _snprintf_s(bDone, sizeof(bDone), _TRUNCATE, "✓ %s###ca_%d", title, attrType);
-                    _snprintf_s(bIdle, sizeof(bIdle), _TRUNCATE, "应用%s###ca_%d", title, attrType);
-                    if (DrawAppliedActionBtn(bDone, bIdle, done, false, 105.0f, 24.0f))
+                    _snprintf_s(bIdle, sizeof(bIdle), _TRUNCATE, "%s###ca_%d", title, attrType);
+                    if (DrawAppliedActionBtn(bDone, bIdle, done, false, -1.0f, 24.0f))
                         PostRequestEx(REQ_MOD_CHAR_ATTR, g_selectedCharId, attrType, *val);
+                    ItemTip(tip);
                 };
 
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); drawCharAttrCell("攻速",   "##c_aspd", &g_charAtkSpeed,    50.0f,   100.0f,  "%.0f", 7);
-                ImGui::TableSetColumnIndex(1); drawCharAttrCell("间隔(s)","##c_bat",  &g_charBaseAtkTime, 0.05f,   0.1f,    "%.2f", 8);
+                ImGui::TableSetColumnIndex(0); drawCharAttrCell("鬼畜攻速 (改攻速)",     "##c_aspd", &g_charAtkSpeed,    50.0f,   100.0f,  "%.0f", 7,  "修改干员攻击速度（默认100，设为500直接变加特林）");
+                ImGui::TableSetColumnIndex(1); drawCharAttrCell("零帧起手 (改攻击间隔s)","##c_bat",  &g_charBaseAtkTime, 0.05f,   0.1f,    "%.2f", 8,  "修改基础攻击间隔（秒，越小出手越快，推荐 0.10~0.20）");
 
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); drawCharAttrCell("攻击力", "##c_atk",  &g_charAtk,         500.0f,  1000.0f, "%.0f", 1);
-                ImGui::TableSetColumnIndex(1); drawCharAttrCell("生命值", "##c_hp",   &g_charMaxHp,       5000.0f, 10000.0f,"%.0f", 0);
+                ImGui::TableSetColumnIndex(0); drawCharAttrCell("核弹伤害 (改攻击力)",   "##c_atk",  &g_charAtk,         500.0f,  1000.0f, "%.0f", 1,  "修改干员攻击力（一刀一个小朋友）");
+                ImGui::TableSetColumnIndex(1); drawCharAttrCell("肉山血牛 (改生命上限)", "##c_hp",   &g_charMaxHp,       5000.0f, 10000.0f,"%.0f", 0,  "修改干员最大生命值并立刻回满当前血量");
 
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); drawCharAttrCell("防御力", "##c_def",  &g_charDef,         200.0f,  500.0f,  "%.0f", 2);
-                ImGui::TableSetColumnIndex(1); drawCharAttrCell("法抗",   "##c_res",  &g_charMagicRes,    10.0f,   20.0f,   "%.0f", 3);
+                ImGui::TableSetColumnIndex(0); drawCharAttrCell("移动要塞 (改防御力)",   "##c_def",  &g_charDef,         200.0f,  500.0f,  "%.0f", 2,  "修改干员物理防御力，物理怪打上来全是抛光");
+                ImGui::TableSetColumnIndex(1); drawCharAttrCell("魔免圣体 (改法术抗性)", "##c_res",  &g_charMagicRes,    10.0f,   20.0f,   "%.0f", 3,  "修改干员法术抗性（95~100 近乎免疫法术伤害）");
 
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); drawCharAttrCell("阻挡数", "##c_blk",  &g_charBlockCnt,    1.0f,    2.0f,    "%.0f", 5);
-                ImGui::TableSetColumnIndex(1); drawCharAttrCell("技力/s", "##c_sp",   &g_charSpRecov,     5.0f,    10.0f,   "%.1f", 14);
+                ImGui::TableSetColumnIndex(0); drawCharAttrCell("一夫当关 (改阻挡数)",   "##c_blk",  &g_charBlockCnt,    1.0f,    2.0f,    "%.0f", 5,  "修改干员最大阻挡数，高台狙击都能当盾用");
+                ImGui::TableSetColumnIndex(1); drawCharAttrCell("核能回转 (改技力/秒)",  "##c_sp",   &g_charSpRecov,     5.0f,    10.0f,   "%.1f", 14, "修改每秒自动技力回复速度并立刻回满 SP");
+
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); drawCharAttrCell("绝世显眼包 (改嘲讽值)", "##c_tnt",  &g_charTaunt,       1.0f,    5.0f,    "%.0f", 20, "正数(+10)疯狂吸引全图仇恨当沙包；负数(-10)彻底隐身不挨打");
+                ImGui::TableSetColumnIndex(1); drawCharAttrCell("大力出奇迹 (改推拉力)", "##c_frc",  &g_charForce,       1.0f,    2.0f,    "%.0f", 24, "修改干员基础推拉力度 (BASE_FORCE_LEVEL)，数值越大推得越远");
 
                 ImGui::EndTable();
             }
@@ -3477,20 +4857,20 @@ static void DrawBattleCustomizerTab()
         }
 
         // ------------------------------------------------------------
-        // 子页 ②：敌方怪物改造 & 动态刷怪器
+        // 子页 ②：整合运动改造厂（敌方怪物改造 & 动态刷怪器）
         // ------------------------------------------------------------
-        if (ImGui::BeginTabItem("② 敌方怪物 & 刷怪"))
+        if (ImGui::BeginTabItem("② 整合运动改造厂 (敌方怪物 & 刷怪)"))
         {
             // A. 场上存活怪物选择
             {
                 bool allE = (g_enemyFilter[0] == 0);
                 if (allE) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.28f, 0.18f, 1.0f));
                 char allBtn[64];
-                _snprintf_s(allBtn, sizeof(allBtn), _TRUNCATE, "★ 全场怪物 (%d只)###enm_all", localEnemyTotal);
+                _snprintf_s(allBtn, sizeof(allBtn), _TRUNCATE, "★ 全场倒霉蛋 (%d只)###enm_all", localEnemyTotal);
                 if (ImGui::SmallButton(allBtn))
                 {
                     g_enemyFilter[0] = 0;
-                    CopyStrSafe(g_enemyLabel, sizeof(g_enemyLabel), "全场所有怪物");
+                    CopyStrSafe(g_enemyLabel, sizeof(g_enemyLabel), "全场所有倒霉蛋");
                 }
                 if (allE) ImGui::PopStyleColor();
 
@@ -3513,27 +4893,57 @@ static void DrawBattleCustomizerTab()
                 }
             }
 
-            ImGui::SetNextItemWidth(200.0f);
-            if (ImGui::InputTextWithHint("##eflt", "怪物过滤 (中文/ID，留空=全场)", g_enemyFilter, sizeof(g_enemyFilter)))
-                CopyStrSafe(g_enemyLabel, sizeof(g_enemyLabel), g_enemyFilter[0] ? g_enemyFilter : "全场所有怪物");
+            ImGui::SetNextItemWidth(220.0f);
+            if (ImGui::InputTextWithHint("##eflt", "怪物筛选 (中文/ID，留空=全场)", g_enemyFilter, sizeof(g_enemyFilter)))
+                CopyStrSafe(g_enemyLabel, sizeof(g_enemyLabel), g_enemyFilter[0] ? g_enemyFilter : "全场所有倒霉蛋");
             ImGui::SameLine();
-            ImGui::TextDisabled("当前: %s", g_enemyLabel);
+            ImGui::TextDisabled("当前改造对象: %s", g_enemyLabel);
 
-            // B. 5 个怪物快捷处置按钮（带状态变色）
-            if (DrawAppliedActionBtn("✓ 沙包木桩###e_sb", "改百万血沙包###e_sb", applied.enemySandbag, false, 118.0f, 26.0f))
-                PostRequestEx(REQ_MOD_ENEMY_SANDBAG, g_enemyFilter, 0, 0.0f);
-            ImGui::SameLine();
-            if (DrawAppliedActionBtn("✓ 已定身###e_frz", "定身 (移速0)###e_frz", applied.enemyFrozen, false, 102.0f, 26.0f))
-                PostRequestEx(REQ_MOD_ENEMY_ATTR, g_enemyFilter, 6, 0.0f);
-            ImGui::SameLine();
-            if (ImGui::Button("恢复移速", ImVec2(78.0f, 26.0f)))
-                PostRequestEx(REQ_MOD_ENEMY_ATTR, g_enemyFilter, 6, 1.0f);
-            ImGui::SameLine();
-            if (DrawAppliedActionBtn("✓ 蓝门不扣血###e_uh", "蓝门不扣血###e_uh", applied.enemyUnharmful, false, 106.0f, 26.0f))
-                PostRequestEx(REQ_MOD_ENEMY_UNHARMFUL, g_enemyFilter, 0, 0.0f);
-            ImGui::SameLine();
-            if (DrawDangerBtn("主线程一键秒杀###e_kill", 116.0f, 26.0f))
+            // B. 敌方 6 大快捷处置矩阵（3列×2行，整齐无溢出）+ 灭霸响指秒杀条
+            if (ImGui::BeginTable("##EnemyQuickOps", 3, ImGuiTableFlags_SizingStretchSame))
+            {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                if (DrawAppliedActionBtn("✓ 百万血沙包 (0攻防/定身)###e_sb", "百万血沙包 (100万血/0攻防)###e_sb",
+                                         applied.enemySandbag, false, -1.0f, 26.0f))
+                    PostRequestEx(REQ_MOD_ENEMY_SANDBAG, g_enemyFilter, 0, 0.0f);
+                ItemTip("一键改成 100万血 + 0攻击 + 0双抗 + 定身 + 进蓝门不扣血的极品测伤木桩");
+
+                ImGui::TableSetColumnIndex(1);
+                if (DrawAppliedActionBtn("✓ 世界时间静止 (移速归零)###e_frz", "世界时间静止 (移速=0定身)###e_frz",
+                                         applied.enemyFrozen, false, -1.0f, 26.0f))
+                    PostRequestEx(REQ_MOD_ENEMY_ATTR, g_enemyFilter, 6, 0.0f);
+                ItemTip("把场上匹配怪物的移速设为 0，原地罚站当靶子");
+
+                ImGui::TableSetColumnIndex(2);
+                if (ImGui::Button("解除石化 (恢复移速=1)", ImVec2(-1.0f, 26.0f)))
+                    PostRequestEx(REQ_MOD_ENEMY_ATTR, g_enemyFilter, 6, 1.0f);
+                ItemTip("把被定身的怪物移速恢复为 1.0，继续逛街");
+
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                if (DrawAppliedActionBtn("✓ 红门观光客 (进蓝门不扣血)###e_uh", "红门观光客 (进蓝门不扣血)###e_uh",
+                                         applied.enemyUnharmful, false, -1.0f, 26.0f))
+                    PostRequestEx(REQ_MOD_ENEMY_UNHARMFUL, g_enemyFilter, 0, 0.0f);
+                ItemTip("把目标怪物标记为无害游客，大摇大摆走进蓝门也绝不扣我方生命");
+
+                ImGui::TableSetColumnIndex(1);
+                if (DrawAppliedActionBtn("✓ 失重气球 (怪物零重量)###e_wl", "失重气球 (怪物零重量)###e_wl",
+                                         applied.enemyWeightless, false, -1.0f, 26.0f))
+                    PostRequestEx(REQ_MOD_ENEMY_WEIGHTLESS, g_enemyFilter, 23, 0.0f);
+                ItemTip("把怪物重量 (MASS_LEVEL) 抽干成 0，搭配我方「大力出奇迹」让重装大爹当场起飞！");
+
+                ImGui::TableSetColumnIndex(2);
+                if (ImGui::Button("全图照妖镜 (破隐匿/迷彩)", ImVec2(-1.0f, 26.0f)))
+                    PostRequestEx(REQ_MOD_ENEMY_REVEAL, g_enemyFilter, 0, 0.0f);
+                ItemTip("立刻剥离场上匹配怪物的隐匿与迷彩 Buff，让所有老六无处遁形");
+
+                ImGui::EndTable();
+            }
+
+            if (DrawDangerBtn("☠ 灭霸响指 · 全图灰飞烟灭 (Unity 主线程安全秒杀匹配怪物)###e_kill", -1.0f, 26.0f))
                 PostRequestEx(REQ_MOD_ENEMY_KILL, g_enemyFilter, 0, 0.0f);
+            ItemTip("在 Unity 主线程调用原生 FinishWithNoReason 瞬间清场，安全推进波次不卡关");
 
             ImGui::Separator();
 
@@ -3542,28 +4952,28 @@ static void DrawBattleCustomizerTab()
             {
                 auto drawEnmAttrCell = [&](const char *title, const char *idTag, float *val,
                                            float step, float stepFast, const char *fmt, int attrType) {
-                    ImGui::SetNextItemWidth(105.0f);
+                    ImGui::SetNextItemWidth(110.0f);
                     ImGui::InputFloat(idTag, val, step, stepFast, fmt);
                     ImGui::SameLine();
-                    bool done = (applied.enemyAttrMask & (1u << attrType)) != 0;
-                    char bDone[64], bIdle[64];
+                    bool done = (attrType >= 0 && attrType < 64) && ((applied.enemyAttrMask & (1ULL << attrType)) != 0);
+                    char bDone[96], bIdle[96];
                     _snprintf_s(bDone, sizeof(bDone), _TRUNCATE, "✓ %s###ea_%d", title, attrType);
-                    _snprintf_s(bIdle, sizeof(bIdle), _TRUNCATE, "改%s###ea_%d", title, attrType);
-                    if (DrawAppliedActionBtn(bDone, bIdle, done, false, 95.0f, 24.0f))
+                    _snprintf_s(bIdle, sizeof(bIdle), _TRUNCATE, "%s###ea_%d", title, attrType);
+                    if (DrawAppliedActionBtn(bDone, bIdle, done, false, -1.0f, 24.0f))
                         PostRequestEx(REQ_MOD_ENEMY_ATTR, g_enemyFilter, attrType, *val);
                 };
 
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); drawEnmAttrCell("血量", "##e_hp",  &g_enemyMaxHp,   10000.0f, 100000.0f, "%.0f", 0);
-                ImGui::TableSetColumnIndex(1); drawEnmAttrCell("攻击", "##e_atk", &g_enemyAtk,     100.0f,   500.0f,    "%.0f", 1);
+                ImGui::TableSetColumnIndex(0); drawEnmAttrCell("血条魔改 (改血量)", "##e_hp",  &g_enemyMaxHp,   10000.0f, 100000.0f, "%.0f", 0);
+                ImGui::TableSetColumnIndex(1); drawEnmAttrCell("刮痧大师 (改攻击)", "##e_atk", &g_enemyAtk,     100.0f,   500.0f,    "%.0f", 1);
 
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); drawEnmAttrCell("防御", "##e_def", &g_enemyDef,     100.0f,   500.0f,    "%.0f", 2);
-                ImGui::TableSetColumnIndex(1); drawEnmAttrCell("法抗", "##e_res", &g_enemyMagicRes,10.0f,    20.0f,     "%.0f", 3);
+                ImGui::TableSetColumnIndex(0); drawEnmAttrCell("脆皮纸糊 (改防御)", "##e_def", &g_enemyDef,     100.0f,   500.0f,    "%.0f", 2);
+                ImGui::TableSetColumnIndex(1); drawEnmAttrCell("魔抗清零 (改法抗)", "##e_res", &g_enemyMagicRes,10.0f,    20.0f,     "%.0f", 3);
 
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); drawEnmAttrCell("移速", "##e_spd", &g_enemyMoveSpd, 0.2f,     0.5f,      "%.2f", 6);
-                ImGui::TableSetColumnIndex(1); drawEnmAttrCell("攻速", "##e_asp", &g_enemyAtkSpd,  20.0f,    50.0f,     "%.0f", 7);
+                ImGui::TableSetColumnIndex(0); drawEnmAttrCell("龟速爬行 (改移速)", "##e_spd", &g_enemyMoveSpd, 0.2f,     0.5f,      "%.2f", 6);
+                ImGui::TableSetColumnIndex(1); drawEnmAttrCell("老年挥棒 (改攻速)", "##e_asp", &g_enemyAtkSpd,  20.0f,    50.0f,     "%.0f", 7);
 
                 ImGui::EndTable();
             }
@@ -3571,13 +4981,13 @@ static void DrawBattleCustomizerTab()
             ImGui::Spacing();
 
             // D. 本关动态刷怪器（可折叠区块，含 60 只场上上限保护）
-            char spHdr[128];
+            char spHdr[160];
             _snprintf_s(spHdr, sizeof(spHdr), _TRUNCATE,
-                        "本关动态刷怪器（预加载 %ld 种 · %ld 条路线 · 场上 %d/60）###SpawnHdr",
+                        "红门时空裂缝 · 动态刷怪器（本关花名册 %ld 种 · %ld 条路线 · 场上 %d/60）###SpawnHdr",
                         (long)g_stageEnemyCount, (long)g_stageRouteCount, localEnemyTotal);
             if (ImGui::CollapsingHeader(spHdr, ImGuiTreeNodeFlags_DefaultOpen))
             {
-                if (ImGui::SmallButton("重新读取本关怪物"))
+                if (ImGui::SmallButton("重新破译花名册(重读本关怪物)"))
                     PostRequestEx(REQ_SCAN_STAGE_ENEMIES, "", 0, 0.0f);
 
                 const int ecnt = (int)g_stageEnemyCount;
@@ -3607,9 +5017,9 @@ static void DrawBattleCustomizerTab()
                 if (g_spawnCount < 1) g_spawnCount = 1;
                 if (g_spawnCount > 20) g_spawnCount = 20;
                 ImGui::SameLine();
-                ImGui::Checkbox("套用属性", &g_spawnApplyCustom);
+                ImGui::Checkbox("出生即魔改属性", &g_spawnApplyCustom);
                 ImGui::SameLine();
-                if (DrawAppliedActionBtn("刷出###spGo", "★ 刷出###spGo", false, true, 80.0f, 24.0f))
+                if (DrawAppliedActionBtn("★ 撕开裂缝刷出###spGo", "★ 撕开裂缝刷出(刷怪)###spGo", false, true, 168.0f, 24.0f))
                     PostRequestEx(REQ_SPAWN_ENEMY, g_spawnEnemyKey, 0, 0.0f, g_spawnRouteIdx, g_spawnCount);
             }
 
@@ -3621,16 +5031,16 @@ static void DrawBattleCustomizerTab()
     ImGui::EndDisabled();
 
     // ========================================================================
-    // 4. 底部默认折叠的操作历史抽屉（需要时点开看，不占主视野）
+    // 4. 底部默认折叠的施法历史抽屉（需要时点开看，不占主视野）
     // ========================================================================
     ImGui::Spacing();
-    char histHdr[64];
-    _snprintf_s(histHdr, sizeof(histHdr), _TRUNCATE, "操作历史记录 (%d/8)###HistDrawer", histCount);
+    char histHdr[80];
+    _snprintf_s(histHdr, sizeof(histHdr), _TRUNCATE, "黑科技施法记录 (%d/8)###HistDrawer", histCount);
     if (ImGui::CollapsingHeader(histHdr))
     {
         if (histCount == 0)
         {
-            ImGui::TextDisabled("暂无操作记录");
+            ImGui::TextDisabled("暂无施法记录，快去按几个按钮整活吧！");
         }
         else
         {
@@ -3645,16 +5055,16 @@ static void DrawBattleCustomizerTab()
     }
 }
 
-// 渲染线程，在主面板 TabBar 首位渲染「★ 战斗定制」+ 收拢后的「开发工具 (6合1)」
+// 渲染线程，在主面板 TabBar 首位渲染「★ 物理法则改写」+ 收拢后的「博士实验室 (开发工具)」
 void Mod_DrawPanelTabs()
 {
-    if (ImGui::BeginTabItem("★ 战斗定制"))
+    if (ImGui::BeginTabItem("★ 物理法则改写 (战斗定制)"))
     {
         DrawBattleCustomizerTab();
         ImGui::EndTabItem();
     }
 
-    if (ImGui::BeginTabItem("开发工具"))
+    if (ImGui::BeginTabItem("博士实验室 (开发工具)"))
     {
         if (ImGui::BeginTabBar("##DevToolsSubTabs"))
         {
@@ -3711,11 +5121,20 @@ void Mod_DrawPanelTabs()
 
 void Mod_OnShutdown()
 {
-    Log("[user] Mod_OnShutdown —— 保存配置并清理");
+    Log("[user] Mod_OnShutdown —— 保存配置并安全撤电清理");
     InterlockedExchange(&g_lockInfAmmo, 0);
     InterlockedExchange(&g_lockInfSp, 0);
     InterlockedExchange(&g_lockGodHp, 0);
     InterlockedExchange(&g_lockBattleDp, 0);
+    InterlockedExchange(&g_lockImmune, 0);
+    InterlockedExchange(&g_ruleAllTerrain, 0);
+    InterlockedExchange(&g_ruleOverlap, 0);
+    InterlockedExchange(&g_ruleGlobalRange, 0);
+    InterlockedExchange(&g_ruleIgnoreMotion, 0);
+    g_tileBackupCount     = 0;
+    g_cardCondBackupCount = 0;
+    g_rangeBackupCount    = 0;
+    g_motionBackupCount   = 0;
     if (ArkCfgTakeDirty())
         ArkCfgSave();
 }

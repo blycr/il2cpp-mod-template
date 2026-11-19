@@ -401,19 +401,19 @@ static void PanelDraw()
 {
     if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_Reorderable))
     {
-        // 主功能标签置顶首屏（★ 战斗定制 + 开发工具 6合1），减少标签切换噪音
+        // 主功能标签置顶首屏（★ 物理法则改写 + 博士实验室 6合1），减少标签切换噪音
         Mod_DrawPanelTabs();
-        if (ImGui::BeginTabItem("日志"))
+        if (ImGui::BeginTabItem("行动黑匣子 (日志)"))
         {
             LogPanelDraw();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("状态"))
+        if (ImGui::BeginTabItem("神经同步率 (状态)"))
         {
             PanelDrawStatus();
             ImGui::EndTabItem();
         }
-        if (MOD_TOOL_DLL[0] && ImGui::BeginTabItem("外部工具"))
+        if (MOD_TOOL_DLL[0] && ImGui::BeginTabItem("外部插件 (工具)"))
         {
             ToolDrawInPanel();
             ImGui::EndTabItem();
