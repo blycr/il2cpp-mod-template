@@ -226,10 +226,50 @@ namespace
     int            g_tileBackupCount     = 0;
     CardCondBackup g_cardCondBackups[128];
     int            g_cardCondBackupCount = 0;
-    RangeBackup    g_rangeBackups[256];
+    RangeBackup    g_rangeBackups[512];
     int            g_rangeBackupCount    = 0;
-    MotionBackup   g_motionBackups[256];
+    MotionBackup   g_motionBackups[512];
     int            g_motionBackupCount   = 0;
+
+    // ---- 独立作用域锁定 & 新部署/重下/新召唤单位自动继承引擎（纯 POD，零堆/零 STL）----
+    // 每条持续锁/规则独立记住开启时的目标范围（"" = 全体，否则为 char_id），
+    // 绝不因玩家随手点选某个干员查看面板而导致已开启的「全体」功能失效！
+    char g_scopeInfAmmo[96]       = "";
+    char g_scopeInfSp[96]         = "";
+    char g_scopeGodHp[96]         = "";
+    char g_scopeImmune[96]        = "";
+    char g_scopeGlobalRange[96]   = "";
+    char g_scopeIgnoreMotion[96]  = "";
+    char g_scopeZeroCost[96]      = "";
+    char g_scopeZeroRespawn[96]   = "";
+    char g_scopeDeployLimit[96]   = "";
+    char g_scopeFullRefund[96]    = "";
+    char g_scopeEnemySandbag[96]  = "";
+    char g_scopeEnemyUnharmful[96]= "";
+
+    struct ActiveAttrRecipe
+    {
+        bool  globalActive;
+        float globalVal;
+        bool  singleActive;
+        char  singleFilter[96];
+        float singleVal;
+    };
+    ActiveAttrRecipe g_charAttrRecipes[38];
+    ActiveAttrRecipe g_enemyAttrRecipes[38];
+    volatile LONG    g_enemyAutoInherit = 0; // 默认关闭；开启后新出红门的怪自动继承本局已启用的敌方改造
+
+    struct SyncedEntityKey
+    {
+        Il2CppObject *ptr;
+        int32_t       respawnCnt;
+    };
+    SyncedEntityKey g_syncedChars[256];
+    int             g_syncedCharCount  = 0;
+    Il2CppObject   *g_syncedCards[128];
+    int             g_syncedCardCount  = 0;
+    SyncedEntityKey g_syncedEnemies[256];
+    int             g_syncedEnemyCount = 0;
 
     Request       g_req;
     volatile LONG g_dumpPending  = 0;
@@ -1227,6 +1267,7 @@ static void ResetPerBattleState(bool clearLocks)
         InterlockedExchange(&g_lockGodHp, 0);
         InterlockedExchange(&g_lockBattleDp, 0);
         InterlockedExchange(&g_lockImmune, 0);
+        InterlockedExchange(&g_enemyAutoInherit, 0);
     }
     // 规则改写开关与对象指针备份强制随对局清空（绝不把旧场景指针带进下一关！）
     InterlockedExchange(&g_ruleAllTerrain, 0);
@@ -1237,6 +1278,25 @@ static void ResetPerBattleState(bool clearLocks)
     g_cardCondBackupCount = 0;
     g_rangeBackupCount    = 0;
     g_motionBackupCount   = 0;
+
+    // 清空独立作用域、属性附魔配方表与新部署追踪缓存
+    g_scopeInfAmmo[0]        = 0;
+    g_scopeInfSp[0]          = 0;
+    g_scopeGodHp[0]          = 0;
+    g_scopeImmune[0]         = 0;
+    g_scopeGlobalRange[0]    = 0;
+    g_scopeIgnoreMotion[0]   = 0;
+    g_scopeZeroCost[0]       = 0;
+    g_scopeZeroRespawn[0]    = 0;
+    g_scopeDeployLimit[0]    = 0;
+    g_scopeFullRefund[0]     = 0;
+    g_scopeEnemySandbag[0]   = 0;
+    g_scopeEnemyUnharmful[0] = 0;
+    memset(g_charAttrRecipes, 0, sizeof(g_charAttrRecipes));
+    memset(g_enemyAttrRecipes, 0, sizeof(g_enemyAttrRecipes));
+    g_syncedCharCount  = 0;
+    g_syncedCardCount  = 0;
+    g_syncedEnemyCount = 0;
 
     SpinLock(&g_snapLock);
     memset(&g_applied, 0, sizeof(g_applied));
@@ -3078,11 +3138,19 @@ static void ApplyRuleGlobalRange(bool enable, const char *filter, int *outChars,
                 }
                 if (!grComp) continue;
 
-                // 记录原射程备份（每个 selector 只记录一次原始 m_range）
+                // 记录原射程备份（每个 selector 只记录一次原始 m_range；容量 512，满时自动清理已销毁的旧条目）
                 bool alreadyBacked = false;
                 for (int b = 0; b < g_rangeBackupCount; ++b)
                     if (g_rangeBackups[b].selector == sel) { alreadyBacked = true; break; }
-                if (!alreadyBacked && g_rangeBackupCount < 256)
+                if (!alreadyBacked && g_rangeBackupCount >= 480)
+                {
+                    int w = 0;
+                    for (int b = 0; b < g_rangeBackupCount; ++b)
+                        if (g_rangeBackups[b].selector && IsUnityObjAlive(g_rangeBackups[b].selector))
+                            g_rangeBackups[w++] = g_rangeBackups[b];
+                    g_rangeBackupCount = w;
+                }
+                if (!alreadyBacked && g_rangeBackupCount < 512)
                 {
                     g_rangeBackups[g_rangeBackupCount].selector  = sel;
                     g_rangeBackups[g_rangeBackupCount].origRange = curRange;
@@ -3217,11 +3285,19 @@ static void ApplyRuleIgnoreMotion(bool enable, const char *filter, int *outSels,
                     optBase = ArkReflectFieldAddr(fOpts, sel);
                 }
 
-                // 查找或记录原值备份
+                // 查找或记录原值备份（容量 512，满时自动压缩死指针）
                 MotionBackup *mb = nullptr;
                 for (int b = 0; b < g_motionBackupCount; ++b)
                     if (g_motionBackups[b].selector == sel) { mb = &g_motionBackups[b]; break; }
-                if (!mb && g_motionBackupCount < 256)
+                if (!mb && g_motionBackupCount >= 480)
+                {
+                    int w = 0;
+                    for (int b = 0; b < g_motionBackupCount; ++b)
+                        if (g_motionBackups[b].selector && IsUnityObjAlive(g_motionBackups[b].selector))
+                            g_motionBackups[w++] = g_motionBackups[b];
+                    g_motionBackupCount = w;
+                }
+                if (!mb && g_motionBackupCount < 512)
                 {
                     mb = &g_motionBackups[g_motionBackupCount++];
                     memset(mb, 0, sizeof(*mb));
@@ -3423,7 +3499,278 @@ static int ApplyCharFullRefund(const char *filter, char *lastMatched, int cap)
 }
 
 // ============================================================================
-// 持续自动锁定驱动（100% 运行在 Unity 主线程顶层消息泵 + 幂等跳过已满状态）
+// 活跃规则配方记录 + 新部署干员 / 重下干员 / 新召唤手牌自动继承引擎
+// （解决：先开全局功能、再部署新干员/撤退重下/召唤物进手牌、或随手点干员看面板导致新单位不受控）
+// ============================================================================
+static void RecordAttrRecipe(ActiveAttrRecipe *table, const char *filter, int attrType, float val)
+{
+    if (!table || attrType < 0 || attrType >= 38) return;
+    ActiveAttrRecipe &r = table[attrType];
+    if (!filter || !filter[0])
+    {
+        r.globalActive = true;
+        r.globalVal    = val;
+        // 后设的全局覆盖早先的单人微调，符合「最后一次操作优先」直觉
+        r.singleActive = false;
+        r.singleFilter[0] = 0;
+    }
+    else
+    {
+        // 单人微调绝不破坏已开启的全局配方！
+        r.singleActive = true;
+        CopyStrSafe(r.singleFilter, sizeof(r.singleFilter), filter);
+        r.singleVal    = val;
+    }
+}
+
+// 合并单次强化（0费/0秒重下/无限部署位/全额退款等）的作用域：一旦开过全体就保持全体
+static void RecordFeatureScope(char *dstScope, int cap, const char *newFilter, bool alreadyActive)
+{
+    if (!dstScope || cap <= 0) return;
+    if (!newFilter || !newFilter[0])
+    {
+        dstScope[0] = 0; // 升级为全体
+        return;
+    }
+    if (alreadyActive && dstScope[0] == 0)
+        return; // 已是全体，不降级为单人
+    CopyStrSafe(dstScope, cap, newFilter);
+}
+
+static int32_t ReadEntityRespawnCnt(Il2CppObject *ent, Il2CppClass *ek)
+{
+    if (!ent || !ek) return 0;
+    if (FieldInfo *fRc = ArkReflectFindField(ek, "m_respawnCnt", nullptr))
+        if (void *a = ArkReflectFieldAddr(fRc, ent)) return *(int32_t *)a;
+    return 0;
+}
+
+static bool MarkEntitySyncedIfNew(SyncedEntityKey *arr, int *cnt, int cap, Il2CppObject *ptr, int32_t respawnCnt)
+{
+    for (int i = 0; i < *cnt; ++i)
+    {
+        if (arr[i].ptr == ptr)
+        {
+            if (arr[i].respawnCnt == respawnCnt)
+                return false; // 同一存活实例已同步过
+            arr[i].respawnCnt = respawnCnt; // 池化复用重下，视作新部署重新灌魔！
+            return true;
+        }
+    }
+    if (*cnt >= cap)
+    {
+        // 清理已死亡/失效的旧槽位
+        int w = 0;
+        for (int i = 0; i < *cnt; ++i)
+            if (arr[i].ptr && IsUnityObjAlive(arr[i].ptr))
+                arr[w++] = arr[i];
+        *cnt = w;
+    }
+    if (*cnt < cap)
+    {
+        arr[*cnt].ptr = ptr;
+        arr[*cnt].respawnCnt = respawnCnt;
+        ++(*cnt);
+    }
+    return true;
+}
+
+static bool MarkCardSyncedIfNew(Il2CppObject *card)
+{
+    for (int i = 0; i < g_syncedCardCount; ++i)
+        if (g_syncedCards[i] == card) return false;
+    if (g_syncedCardCount < 128)
+        g_syncedCards[g_syncedCardCount++] = card;
+    return true;
+}
+
+static bool HasAnyCharAttrRecipe()
+{
+    for (int i = 0; i < 38; ++i)
+        if (g_charAttrRecipes[i].globalActive || g_charAttrRecipes[i].singleActive)
+            return true;
+    return false;
+}
+
+static bool HasAnyEnemyAttrRecipe()
+{
+    for (int i = 0; i < 38; ++i)
+        if (g_enemyAttrRecipes[i].globalActive || g_enemyAttrRecipes[i].singleActive)
+            return true;
+    return false;
+}
+
+// 将所有已开启的全局/单人配方自动同步到「刚刚新部署/重下/召唤的干员」、「新生成的手牌」以及「可选的新波次怪物」
+static void SyncActiveRulesToNewUnits()
+{
+    if (InterlockedCompareExchange(&g_battlePhase, 0, 0) != PHASE_PLAYING)
+        return;
+
+    Il2CppApi &api = ir::Api();
+    Il2CppObject *bc = GetBattleControllerFast();
+    if (!bc) return;
+
+    // 1) 新部署 / 撤退重下 / 召唤上场的我方干员自动继承所有已激活属性配方、全额退款、全图射程、地空通吃
+    const bool hasRecipes   = HasAnyCharAttrRecipe();
+    const bool needCharSync = hasRecipes || g_applied.fullRefund ||
+                              (InterlockedCompareExchange(&g_ruleGlobalRange, 0, 0) != 0) ||
+                              (InterlockedCompareExchange(&g_ruleIgnoreMotion, 0, 0) != 0) ||
+                              (InterlockedCompareExchange(&g_lockImmune, 0, 0) != 0);
+    if (needCharSync)
+    {
+        const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Character");
+        if (ce && ce->klass)
+        {
+            Il2CppObject *chars[256];
+            int n = GetBattleCharactersFast(bc, chars, 256);
+            FieldInfo *fData = ArkReflectFindField(ce->klass, "<data>k__BackingField", nullptr);
+            FieldInfo *fAttr = ArkReflectFindField(ce->klass, "m_attributes", nullptr);
+            bool anyNewChar = false;
+
+            for (int i = 0; i < n; ++i)
+            {
+                Il2CppObject *chr = chars[i];
+                if (!chr || !fData || !IsEntityAlive(chr, ce->klass)) continue;
+                int32_t rc = ReadEntityRespawnCnt(chr, ce->klass);
+                if (!MarkEntitySyncedIfNew(g_syncedChars, &g_syncedCharCount, 256, chr, rc))
+                    continue;
+
+                anyNewChar = true;
+                Il2CppObject *dataObj = api.il2cpp_field_get_value_object(fData, chr);
+                Il2CppObject *attrObj = fAttr ? api.il2cpp_field_get_value_object(fAttr, chr) : nullptr;
+                char dummy[128] = { 0 };
+
+                if (attrObj && hasRecipes)
+                {
+                    for (int at = 0; at < 38; ++at)
+                    {
+                        const ActiveAttrRecipe &r = g_charAttrRecipes[at];
+                        bool apply = false;
+                        float targetVal = 0.0f;
+                        if (r.globalActive && CheckCharDataMatches(dataObj, "", dummy, sizeof(dummy)))
+                        {
+                            apply = true;
+                            targetVal = r.globalVal;
+                        }
+                        if (r.singleActive && CheckCharDataMatches(dataObj, r.singleFilter, dummy, sizeof(dummy)))
+                        {
+                            apply = true;
+                            targetVal = r.singleVal;
+                        }
+                        if (apply)
+                        {
+                            OverwriteAttributeOnObj(attrObj, at, targetVal);
+                            if (at == 0 /* MAX_HP */)
+                                SetEntityCurrentHp(chr, ce->klass, targetVal);
+                            else if (at == 14 /* SP_RECOVERY_PER_SEC */)
+                                FillEntitySp(chr, ce->klass);
+                        }
+                    }
+                }
+            }
+
+            if (anyNewChar)
+            {
+                if (g_applied.fullRefund)
+                {
+                    char d[64];
+                    ApplyCharFullRefund(g_scopeFullRefund, d, sizeof(d));
+                }
+                if (InterlockedCompareExchange(&g_ruleGlobalRange, 0, 0) != 0)
+                    ApplyRuleGlobalRange(true, g_scopeGlobalRange, nullptr, nullptr);
+                if (InterlockedCompareExchange(&g_ruleIgnoreMotion, 0, 0) != 0)
+                    ApplyRuleIgnoreMotion(true, g_scopeIgnoreMotion, nullptr, nullptr);
+                if (InterlockedCompareExchange(&g_lockImmune, 0, 0) != 0)
+                {
+                    char d[64];
+                    ApplyCharImmune(g_scopeImmune, true, d, sizeof(d));
+                }
+            }
+        }
+    }
+
+    // 2) 新生成的召唤物/装置手牌（如凯尔希/令/巫恋下场后动态加入手牌）自动继承全地形/0费/0秒重下/不占部署位
+    const bool ruleTer = (InterlockedCompareExchange(&g_ruleAllTerrain, 0, 0) != 0);
+    if (ruleTer || g_applied.zeroCost || g_applied.zeroRespawn || g_applied.deployLimit)
+    {
+        Il2CppObject *cards[128];
+        int cn = GetBattleCardsFast(bc, cards, 128);
+        bool anyNewCard = false;
+        for (int i = 0; i < cn; ++i)
+        {
+            if (cards[i] && MarkCardSyncedIfNew(cards[i]))
+                anyNewCard = true;
+        }
+        if (anyNewCard)
+        {
+            char d[64];
+            if (ruleTer)               ApplyRuleAllTerrain(true, nullptr, nullptr);
+            if (g_applied.zeroCost)    ApplyCardCostDelta(g_scopeZeroCost, g_cardCostDelta, d, sizeof(d));
+            if (g_applied.zeroRespawn) ApplyCardResetRespawn(g_scopeZeroRespawn, d, sizeof(d));
+            if (g_applied.deployLimit) ApplyFreeDeployLimit(g_scopeDeployLimit, nullptr);
+        }
+    }
+
+    // 3) 可选：若玩家在敌方页勾选了「新出红门自动继承敌方改造」，则新刷出的怪物自动套用已激活敌方改造
+    if (InterlockedCompareExchange(&g_enemyAutoInherit, 0, 0) != 0)
+    {
+        const bool hasEnmRecipes = HasAnyEnemyAttrRecipe();
+        if (hasEnmRecipes || g_applied.enemySandbag || g_applied.enemyUnharmful)
+        {
+            const ArkClassEntry *ece = ArkReflectFindClass("Torappu.Battle.Enemy");
+            if (ece && ece->klass)
+            {
+                Il2CppObject *enms[256];
+                int en = GetBattleEnemiesFast(bc, enms, 256);
+                FieldInfo *fAttr = ArkReflectFindField(ece->klass, "m_attributes", nullptr);
+                bool anyNewEnm = false;
+                for (int i = 0; i < en; ++i)
+                {
+                    Il2CppObject *enm = enms[i];
+                    if (!enm || !IsEntityAlive(enm, ece->klass)) continue;
+                    int32_t rc = ReadEntityRespawnCnt(enm, ece->klass);
+                    if (!MarkEntitySyncedIfNew(g_syncedEnemies, &g_syncedEnemyCount, 256, enm, rc))
+                        continue;
+                    anyNewEnm = true;
+                    Il2CppObject *attrObj = fAttr ? api.il2cpp_field_get_value_object(fAttr, enm) : nullptr;
+                    char dummy[128] = { 0 };
+                    if (attrObj && hasEnmRecipes)
+                    {
+                        for (int at = 0; at < 38; ++at)
+                        {
+                            const ActiveAttrRecipe &r = g_enemyAttrRecipes[at];
+                            bool apply = false;
+                            float targetVal = 0.0f;
+                            if (r.globalActive && CheckEnemyMatches(enm, ece->klass, "", dummy, sizeof(dummy)))
+                            {
+                                apply = true;
+                                targetVal = r.globalVal;
+                            }
+                            if (r.singleActive && CheckEnemyMatches(enm, ece->klass, r.singleFilter, dummy, sizeof(dummy)))
+                            {
+                                apply = true;
+                                targetVal = r.singleVal;
+                            }
+                            if (apply)
+                            {
+                                OverwriteAttributeOnObj(attrObj, at, targetVal);
+                                if (at == 0) SetEntityCurrentHp(enm, ece->klass, targetVal);
+                            }
+                        }
+                    }
+                }
+                if (anyNewEnm && g_applied.enemyUnharmful)
+                {
+                    char d[64];
+                    ApplyEnemyUnharmful(g_scopeEnemyUnharmful, d, sizeof(d));
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 持续自动锁定驱动（100% Unity 主线程顶层消息泵 + 每项锁独立绑定作用域 + 幂等防重）
 // ============================================================================
 static void PumpPersistentLocks()
 {
@@ -3455,18 +3802,14 @@ static void PumpPersistentLocks()
     FieldInfo *fSp    = ArkReflectFindField(ce->klass, "m_sp", nullptr);
     FieldInfo *fMaxSp = ArkReflectFindField(ce->klass, "<maxSp>k__BackingField", nullptr);
 
-    char targetFilter[128];
-    CopyStrSafe(targetFilter, sizeof(targetFilter), g_selectedCharId);
-
     for (int i = 0; i < n; ++i)
     {
         Il2CppObject *chr = chars[i];
         if (!chr || !fData || !IsEntityAlive(chr, ce->klass)) continue;
+        Il2CppObject *dataObj = api.il2cpp_field_get_value_object(fData, chr);
         char desc[128] = { 0 };
-        if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, chr), targetFilter, desc, sizeof(desc)))
-            continue;
 
-        if (lockHp)
+        if (lockHp && CheckCharDataMatches(dataObj, g_scopeGodHp, desc, sizeof(desc)))
         {
             float maxHp = 0.0f;
             float curHp = 0.0f;
@@ -3484,7 +3827,7 @@ static void PumpPersistentLocks()
             if (maxHp > 0.0f && curHp < maxHp * 0.995f)
                 SetEntityCurrentHp(chr, ce->klass, maxHp);
         }
-        if (lockSp)
+        if (lockSp && CheckCharDataMatches(dataObj, g_scopeInfSp, desc, sizeof(desc)))
         {
             float curSp = 0.0f;
             float maxSp = 100.0f;
@@ -3504,7 +3847,7 @@ static void PumpPersistentLocks()
             if (curSp < maxSp - 0.1f)
                 FillEntitySp(chr, ce->klass);
         }
-        if (lockAmmo)
+        if (lockAmmo && CheckCharDataMatches(dataObj, g_scopeInfAmmo, desc, sizeof(desc)))
         {
             Il2CppObject *myCnts[8];
             int k = FindCharAmmoCounters(chr, ce->klass, myCnts, 8, nullptr, 0);
@@ -3523,7 +3866,7 @@ static void PumpPersistentLocks()
                         if (*(uint8_t *)a != 0) *(uint8_t *)a = 0;
             }
         }
-        if (lockImmune)
+        if (lockImmune && CheckCharDataMatches(dataObj, g_scopeImmune, desc, sizeof(desc)))
         {
             // 对新部署的干员补写抵抗属性，并持续清空眩晕/冰冻/神经损伤等控制效果
             if (fAttr)
@@ -3813,6 +4156,7 @@ static void ConsumeBattleRequestOnMainThread()
     {
         int skipped = 0;
         int cnt = ApplyCardCostDelta(g_req.text, (int32_t)g_req.val, matched, sizeof(matched), &skipped);
+        RecordFeatureScope(g_scopeZeroCost, sizeof(g_scopeZeroCost), g_req.text, g_applied.zeroCost);
         if (cnt > 0)
         {
             g_applied.zeroCost = true;
@@ -3834,6 +4178,7 @@ static void ConsumeBattleRequestOnMainThread()
     {
         int skipped = 0;
         int cnt = ApplyCardResetRespawn(g_req.text, matched, sizeof(matched), &skipped);
+        RecordFeatureScope(g_scopeZeroRespawn, sizeof(g_scopeZeroRespawn), g_req.text, g_applied.zeroRespawn);
         if (cnt > 0 || skipped > 0)
         {
             g_applied.zeroRespawn = true;
@@ -3851,6 +4196,7 @@ static void ConsumeBattleRequestOnMainThread()
     {
         bool alreadyBoosted = false;
         int cnt = ApplyFreeDeployLimit(g_req.text, &alreadyBoosted);
+        RecordFeatureScope(g_scopeDeployLimit, sizeof(g_scopeDeployLimit), g_req.text, g_applied.deployLimit);
         if (cnt > 0 || !alreadyBoosted)
         {
             g_applied.deployLimit = true;
@@ -3869,7 +4215,11 @@ static void ConsumeBattleRequestOnMainThread()
     {
         float beforeVal = 0.0f;
         int skipped = 0;
+        // 记入活跃附魔配方表：后续新部署 / 撤退重下 / 新召唤干员将在 200ms 内自动继承！
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, g_req.attrType, g_req.val);
         int cnt = ApplyCharacterAttribute(g_req.text, g_req.attrType, g_req.val, matched, sizeof(matched), &beforeVal, &skipped);
+        if (g_req.attrType >= 0 && g_req.attrType < 64)
+            g_applied.charAttrMask |= (1ULL << g_req.attrType);
         const char *attrName =
             (g_req.attrType == 7)  ? "攻速" :
             (g_req.attrType == 8)  ? "攻击间隔" :
@@ -3883,20 +4233,16 @@ static void ConsumeBattleRequestOnMainThread()
             (g_req.attrType == 24) ? "推拉力度" : "神秘属性";
         if (cnt > 0)
         {
-            if (g_req.attrType >= 0 && g_req.attrType < 64)
-                g_applied.charAttrMask |= (1ULL << g_req.attrType);
-            SetFeedback(FB_OK, "神兵锻造完成！%d 名干员 (%s) %s：%.2f -> %.2f",
+            SetFeedback(FB_OK, "神兵锻造完成！%d 名干员 (%s) %s：%.2f -> %.2f（新部署/重下自动继承）",
                         cnt, matched[0] ? matched : "匹配干员", attrName, beforeVal, g_req.val);
         }
         else if (skipped > 0)
         {
-            if (g_req.attrType >= 0 && g_req.attrType < 64)
-                g_applied.charAttrMask |= (1ULL << g_req.attrType);
-            SetFeedback(FB_INFO, "场上 %d 名干员的%s早就魔改成 %.2f 啦，无需返工", skipped, attrName, g_req.val);
+            SetFeedback(FB_INFO, "场上 %d 名干员的%s早就魔改成 %.2f 啦（已记入新部署自动继承）", skipped, attrName, g_req.val);
         }
         else
-            SetFeedback(FB_WARN, "场上还没见着 \"%s\"（已提前灌魔到手牌，下场即巅峰！）",
-                        g_req.text[0] ? g_req.text : "我方干员");
+            SetFeedback(FB_OK, "已为 %s 锁定「%s = %.2f」配方：干员一落地立刻自动生效！",
+                        g_req.text[0] ? g_req.text : "全体罗德岛干员", attrName, g_req.val);
         break;
     }
 
@@ -3935,6 +4281,15 @@ static void ConsumeBattleRequestOnMainThread()
     {
         int sk1 = 0, sk2 = 0;
         bool limBoosted = false;
+        RecordFeatureScope(g_scopeZeroCost,    sizeof(g_scopeZeroCost),    g_req.text, g_applied.zeroCost);
+        RecordFeatureScope(g_scopeZeroRespawn, sizeof(g_scopeZeroRespawn), g_req.text, g_applied.zeroRespawn);
+        RecordFeatureScope(g_scopeDeployLimit, sizeof(g_scopeDeployLimit), g_req.text, g_applied.deployLimit);
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, 7,  g_charAtkSpeed);
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, 8,  g_charBaseAtkTime);
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, 1,  g_charAtk);
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, 0,  g_charMaxHp);
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, 14, g_charSpRecov);
+
         int c1 = ApplyCardCostDelta(g_req.text, -99, matched, sizeof(matched), &sk1);
         ApplyCardResetRespawn(g_req.text, matched, sizeof(matched));
         ApplyFreeDeployLimit(g_req.text, &limBoosted);
@@ -3956,7 +4311,7 @@ static void ConsumeBattleRequestOnMainThread()
             g_applied.overload     = true;
             g_applied.charAttrMask |= (1ULL << 0) | (1ULL << 1) | (1ULL << 7) | (1ULL << 8) | (1ULL << 14);
             if (c3 > 0) g_applied.ammoBoosted = true;
-            SetFeedback(FB_OK, "地爆天星超载机枪已轰鸣！新改手牌=%d | 新改场上=%d | 弹匣=%d | DP=99",
+            SetFeedback(FB_OK, "地爆天星超载机枪已轰鸣！新改手牌=%d | 新改场上=%d | 弹匣=%d | DP=99（后续新下干员自动继承）",
                         c1, c2, c3);
         }
         else
@@ -4000,7 +4355,7 @@ static void ConsumeBattleRequestOnMainThread()
         int tCnt = 0, cCnt = 0;
         ApplyRuleAllTerrain(wantOn, &tCnt, &cCnt);
         if (wantOn)
-            SetFeedback(FB_OK, "违章建筑许可证到手！已放开 %d 块地块 + %d 张手牌（高台/地面/禁区随便放，红蓝门已保护）",
+            SetFeedback(FB_OK, "违章建筑许可证到手！已放开 %d 块地块 + %d 张手牌（含新召唤手牌自动放行，红蓝门已保护）",
                         tCnt, cCnt);
         else
             SetFeedback(FB_INFO, "违章建筑已拆除！已恢复 %d 块原始地形与 %d 张手牌放置限制", tCnt, cCnt);
@@ -4024,14 +4379,25 @@ static void ConsumeBattleRequestOnMainThread()
 
     case REQ_TOGGLE_GLOBAL_RANGE:
     {
-        bool wantOn = (InterlockedCompareExchange(&g_ruleGlobalRange, 0, 0) == 0);
+        bool curOn = (InterlockedCompareExchange(&g_ruleGlobalRange, 0, 0) != 0);
+        // 若当前仅对单人开启、且用户切回「全体」再点，则直接升级为「全体」而非关闭！
+        bool upgradeToGlobal = (curOn && g_scopeGlobalRange[0] != 0 && g_req.text[0] == 0);
+        bool wantOn = (!curOn) || upgradeToGlobal;
         InterlockedExchange(&g_ruleGlobalRange, wantOn ? 1 : 0);
-        int cCnt = 0, sCnt = 0;
-        ApplyRuleGlobalRange(wantOn, g_selectedCharId, &cCnt, &sCnt);
         if (wantOn)
+            CopyStrSafe(g_scopeGlobalRange, sizeof(g_scopeGlobalRange), g_req.text);
+        else
+            g_scopeGlobalRange[0] = 0;
+
+        int cCnt = 0, sCnt = 0;
+        ApplyRuleGlobalRange(wantOn, g_scopeGlobalRange, &cCnt, &sCnt);
+        if (upgradeToGlobal)
+            SetFeedback(FB_OK, "洲际导弹已升级为【全体模式】！补装 %d 名干员 (%d 处选择器)，后续新下干员自动继承", cCnt, sCnt);
+        else if (wantOn)
             SetFeedback(FB_OK, cCnt > 0
-                        ? "洲际导弹就位！%d 名干员 (%d 处选择器) 已挂载全图射程（新下干员自动继承）"
-                        : "洲际导弹全图狙已待命：现在下场的干员将自动获得全地图攻击范围！", cCnt, sCnt);
+                        ? "洲际导弹就位【%s】！%d 名干员 (%d 处选择器) 已挂载全图射程（新下/重下干员自动继承）"
+                        : "洲际导弹全图狙已待命【%s】：干员一落地立刻自动挂载全地图射程！",
+                        g_scopeGlobalRange[0] ? g_scopeGlobalRange : "全体", cCnt, sCnt);
         else
             SetFeedback(FB_INFO, "洲际导弹已入库：已为 %d 处选择器恢复原本攻击范围", sCnt);
         needRefreshSnap = false;
@@ -4040,13 +4406,22 @@ static void ConsumeBattleRequestOnMainThread()
 
     case REQ_TOGGLE_IGNORE_MOTION:
     {
-        bool wantOn = (InterlockedCompareExchange(&g_ruleIgnoreMotion, 0, 0) == 0);
+        bool curOn = (InterlockedCompareExchange(&g_ruleIgnoreMotion, 0, 0) != 0);
+        bool upgradeToGlobal = (curOn && g_scopeIgnoreMotion[0] != 0 && g_req.text[0] == 0);
+        bool wantOn = (!curOn) || upgradeToGlobal;
         InterlockedExchange(&g_ruleIgnoreMotion, wantOn ? 1 : 0);
-        int sCnt = 0, revCnt = 0;
-        ApplyRuleIgnoreMotion(wantOn, g_selectedCharId, &sCnt, &revCnt);
         if (wantOn)
-            SetFeedback(FB_OK, "海陆空通吃照妖已开启！放开 %d 处地空索敌 + 照显 %d 只敌方单位（奶妈仍只奶队友）",
-                        sCnt, revCnt);
+            CopyStrSafe(g_scopeIgnoreMotion, sizeof(g_scopeIgnoreMotion), g_req.text);
+        else
+            g_scopeIgnoreMotion[0] = 0;
+
+        int sCnt = 0, revCnt = 0;
+        ApplyRuleIgnoreMotion(wantOn, g_scopeIgnoreMotion, &sCnt, &revCnt);
+        if (upgradeToGlobal)
+            SetFeedback(FB_OK, "海陆空通吃已升级为【全体模式】！补放 %d 处地空索敌 + 照显 %d 只敌方单位", sCnt, revCnt);
+        else if (wantOn)
+            SetFeedback(FB_OK, "海陆空通吃照妖已开启【%s】！放开 %d 处地空索敌 + 照显 %d 只敌方单位（新下干员自动继承）",
+                        g_scopeIgnoreMotion[0] ? g_scopeIgnoreMotion : "全体", sCnt, revCnt);
         else
             SetFeedback(FB_INFO, "海陆空通吃已关闭：已为 %d 处选择器还原原始对地/对空规则", sCnt);
         needRefreshSnap = false;
@@ -4055,18 +4430,32 @@ static void ConsumeBattleRequestOnMainThread()
 
     case REQ_TOGGLE_IMMUNE:
     {
-        bool wantOn = (InterlockedCompareExchange(&g_lockImmune, 0, 0) == 0);
+        bool curOn = (InterlockedCompareExchange(&g_lockImmune, 0, 0) != 0);
+        bool upgradeToGlobal = (curOn && g_scopeImmune[0] != 0 && g_req.text[0] == 0);
+        bool wantOn = (!curOn) || upgradeToGlobal;
         InterlockedExchange(&g_lockImmune, wantOn ? 1 : 0);
         if (wantOn)
         {
-            int hit = ApplyCharImmune(g_selectedCharId, true, matched, sizeof(matched));
+            CopyStrSafe(g_scopeImmune, sizeof(g_scopeImmune), g_req.text);
+            RecordAttrRecipe(g_charAttrRecipes, g_scopeImmune, 26, 0.001f);
+            RecordAttrRecipe(g_charAttrRecipes, g_scopeImmune, 31, 100.0f);
+            RecordAttrRecipe(g_charAttrRecipes, g_scopeImmune, 32, 100.0f);
+            int hit = ApplyCharImmune(g_scopeImmune, true, matched, sizeof(matched));
             g_applied.charAttrMask |= (1ULL << 26) | (1ULL << 31) | (1ULL << 32);
-            SetFeedback(FB_OK, hit > 0
-                        ? "泰拉霸体绝缘体已附体！%d 名干员免控+免元素损伤，晕眩/冰冻/神经损伤统统弹开"
-                        : "泰拉霸体绝缘体已开启（已预设手牌，干员下场立刻百毒不侵！）", hit);
+            if (upgradeToGlobal)
+                SetFeedback(FB_OK, "泰拉霸体绝缘体已升级为【全体模式】！%d 名干员全面免控+免元素损伤", hit);
+            else if (hit > 0)
+                SetFeedback(FB_OK, "泰拉霸体绝缘体已附体【%s】！%d 名干员免控+免元素损伤（新下干员自动继承）",
+                            g_scopeImmune[0] ? g_scopeImmune : "全体", hit);
+            else
+                SetFeedback(FB_OK, "泰拉霸体绝缘体已开启【%s】：干员下场立刻百毒不侵！",
+                            g_scopeImmune[0] ? g_scopeImmune : "全体");
         }
         else
-            SetFeedback(FB_INFO, "霸体绝缘体持续清控已关闭（已写入的本局高抵抗仍保留）");
+        {
+            g_scopeImmune[0] = 0;
+            SetFeedback(FB_INFO, "霸体绝缘体持续清控已关闭");
+        }
         needRefreshSnap = false;
         break;
     }
@@ -4074,6 +4463,10 @@ static void ConsumeBattleRequestOnMainThread()
     case REQ_MOD_CHAR_TRUE_DMG:
     {
         int sk = 0;
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, 33, 1.0f);
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, 34, 1.0f);
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, 17, 1.0f);
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, 18, 1.0f);
         int c1 = ApplyCharacterAttribute(g_req.text, 33 /* DAMAGE_HITRATE_PHYSICAL */, 1.0f, matched, sizeof(matched), nullptr, &sk);
         int c2 = ApplyCharacterAttribute(g_req.text, 34 /* DAMAGE_HITRATE_MAGICAL */,  1.0f, matched, sizeof(matched));
         int c3 = ApplyCharacterAttribute(g_req.text, 17 /* DEF_PENETRATE */,           1.0f, matched, sizeof(matched));
@@ -4082,32 +4475,35 @@ static void ConsumeBattleRequestOnMainThread()
         g_applied.charAttrMask |= (1ULL << 17) | (1ULL << 18) | (1ULL << 33) | (1ULL << 34);
         int tot = c1 + c2 + c3 + c4;
         SetFeedback(FB_OK, tot > 0
-                    ? "因果律必中真伤已觉醒！%s 100%% 命中 + 无视全部物防法抗（闪避/高甲通通蒸发）"
-                    : "目标干员已是因果律真伤完全体（手牌亦同步附魔）",
-                    matched[0] ? matched : g_selectedCharLabel);
+                    ? "因果律必中真伤已觉醒【%s】！100%% 命中 + 无视全部物防法抗（新下/重下自动继承）"
+                    : "因果律真伤配方已锁定【%s】：新下场干员自动 100%% 必中+双穿！",
+                    g_req.text[0] ? g_req.text : "全体");
         break;
     }
 
     case REQ_MOD_CHAR_MEGA_FORCE:
     {
         int sk = 0;
+        RecordAttrRecipe(g_charAttrRecipes, g_req.text, 24, g_charForce);
         int cnt = ApplyCharacterAttribute(g_req.text, 24 /* BASE_FORCE_LEVEL */, g_charForce, matched, sizeof(matched), nullptr, &sk);
         g_applied.megaForce = true;
         g_applied.charAttrMask |= (1ULL << 24);
         SetFeedback(FB_OK, cnt > 0
-                    ? "大力出奇迹！！%d 名干员 (%s) 推拉力度拉满至 %.0f（搭配怪物零重量，一脚踹出银河系！）"
-                    : "目标干员推拉力度已是 %.0f 级神力（手牌亦已注入神力）",
-                    cnt > 0 ? cnt : sk, matched[0] ? matched : g_selectedCharLabel, g_charForce);
+                    ? "大力出奇迹【%s】！%d 名干员推拉力度拉满至 %.0f（新下/重下干员自动继承神力）"
+                    : "大力出奇迹配方已锁定【%s】：推拉力度 %.0f，新下场干员自动拉满！",
+                    g_req.text[0] ? g_req.text : "全体", cnt > 0 ? cnt : sk, g_charForce);
         break;
     }
 
     case REQ_MOD_CHAR_REFUND:
     {
-        int cnt = ApplyCharFullRefund(g_req.text, matched, sizeof(matched));
+        RecordFeatureScope(g_scopeFullRefund, sizeof(g_scopeFullRefund), g_req.text, g_applied.fullRefund);
+        int cnt = ApplyCharFullRefund(g_scopeFullRefund, matched, sizeof(matched));
         g_applied.fullRefund = true;
         SetFeedback(FB_OK, cnt > 0
-                    ? "全额退款不粘锅生效！%d 名场上干员撤退 100%% 退全款（后续新下干员自动享七天无理由退款）"
-                    : "撤退 100%% 返费已开启：后续上场的干员撤退一律原价全额退款！", cnt);
+                    ? "全额退款不粘锅生效【%s】！%d 名干员撤退 100%% 退全款（新下干员自动继承）"
+                    : "撤退 100%% 返费已开启【%s】：后续上场干员撤退一律原价全额退款！",
+                    g_scopeFullRefund[0] ? g_scopeFullRefund : "全体", cnt);
         break;
     }
 
@@ -4115,6 +4511,7 @@ static void ConsumeBattleRequestOnMainThread()
     {
         float beforeVal = 0.0f;
         int skipped = 0;
+        RecordAttrRecipe(g_enemyAttrRecipes, g_req.text, g_req.attrType, g_req.val);
         int cnt = ApplyEnemyAttribute(g_req.text, g_req.attrType, g_req.val, matched, sizeof(matched), &beforeVal, &skipped);
         const char *attrName =
             (g_req.attrType == 0)  ? "血量" :
@@ -4138,13 +4535,21 @@ static void ConsumeBattleRequestOnMainThread()
             SetFeedback(FB_INFO, "这 %d 只怪物的%s早就改成了 %.2f，别再补刀啦", skipped, attrName, g_req.val);
         }
         else
-            SetFeedback(FB_WARN, "场上目前没看见 \"%s\"，等红门放怪再下手！", g_req.text[0] ? g_req.text : "敌人");
+            SetFeedback(FB_WARN, "场上目前没看见 \"%s\"，等红门放怪再下手（或勾选「新出红门自动继承」）", g_req.text[0] ? g_req.text : "敌人");
         break;
     }
 
     case REQ_MOD_ENEMY_SANDBAG:
     {
         int sk = 0;
+        RecordAttrRecipe(g_enemyAttrRecipes, g_req.text, 0, 1000000.0f);
+        RecordAttrRecipe(g_enemyAttrRecipes, g_req.text, 1, 0.0f);
+        RecordAttrRecipe(g_enemyAttrRecipes, g_req.text, 2, 0.0f);
+        RecordAttrRecipe(g_enemyAttrRecipes, g_req.text, 3, 0.0f);
+        RecordAttrRecipe(g_enemyAttrRecipes, g_req.text, 6, 0.0f);
+        RecordFeatureScope(g_scopeEnemySandbag,   sizeof(g_scopeEnemySandbag),   g_req.text, g_applied.enemySandbag);
+        RecordFeatureScope(g_scopeEnemyUnharmful, sizeof(g_scopeEnemyUnharmful), g_req.text, g_applied.enemyUnharmful);
+
         int cnt = ApplyEnemyAttribute(g_req.text, 0, 1000000.0f, matched, sizeof(matched), nullptr, &sk);
         ApplyEnemyAttribute(g_req.text, 1, 0.0f, matched, sizeof(matched));
         ApplyEnemyAttribute(g_req.text, 2, 0.0f, matched, sizeof(matched));
@@ -4168,6 +4573,7 @@ static void ConsumeBattleRequestOnMainThread()
     case REQ_MOD_ENEMY_UNHARMFUL:
     {
         int sk = 0;
+        RecordFeatureScope(g_scopeEnemyUnharmful, sizeof(g_scopeEnemyUnharmful), g_req.text, g_applied.enemyUnharmful);
         int cnt = ApplyEnemyUnharmful(g_req.text, matched, sizeof(matched), &sk);
         if (cnt > 0)
         {
@@ -4187,6 +4593,7 @@ static void ConsumeBattleRequestOnMainThread()
     case REQ_MOD_ENEMY_WEIGHTLESS:
     {
         int sk = 0;
+        RecordAttrRecipe(g_enemyAttrRecipes, g_req.text, 23, 0.0f);
         int cnt = ApplyEnemyAttribute(g_req.text, 23 /* MASS_LEVEL */, 0.0f, matched, sizeof(matched), nullptr, &sk);
         if (cnt > 0 || sk > 0)
         {
@@ -4356,26 +4763,28 @@ void Mod_OnMainPump()
     const bool playingNow = (InterlockedCompareExchange(&g_battlePhase, 0, 0) == PHASE_PLAYING);
     ++g_mainTick;
 
-    // ③ 持续自动锁定 & 规则增量同步（全幂等，仅对新上场干员/新刷出怪物增量生效，0 卡顿）
+    // ③ 持续自动锁定 + 新部署/重下/新召唤单位自动继承同步（每 200ms，全幂等零 GC）
     if (playingNow)
     {
         if (InterlockedCompareExchange(&g_lockBattleDp, 0, 0) != 0)
             ApplyBattleDp(99);
-        if ((g_mainTick % 2) == 0 &&
-            (g_lockInfAmmo || g_lockInfSp || g_lockGodHp || g_lockImmune))
+        if ((g_mainTick % 2) == 0)
         {
-            PumpPersistentLocks();
+            SyncActiveRulesToNewUnits();
+            if (g_lockInfAmmo || g_lockInfSp || g_lockGodHp || g_lockImmune)
+                PumpPersistentLocks();
         }
+        // 每 400ms 幂等补扫开技能切换形态的新选择器 & 剥离新刷出怪物的隐匿/迷彩（各自使用独立绑定的作用域）
         if ((g_mainTick % 4) == 0)
         {
             if (InterlockedCompareExchange(&g_ruleGlobalRange, 0, 0) != 0)
-                ApplyRuleGlobalRange(true, g_selectedCharId, nullptr, nullptr);
+                ApplyRuleGlobalRange(true, g_scopeGlobalRange, nullptr, nullptr);
             if (InterlockedCompareExchange(&g_ruleIgnoreMotion, 0, 0) != 0)
-                ApplyRuleIgnoreMotion(true, g_selectedCharId, nullptr, nullptr);
+                ApplyRuleIgnoreMotion(true, g_scopeIgnoreMotion, nullptr, nullptr);
             if (g_applied.fullRefund)
             {
                 char dummy[64];
-                ApplyCharFullRefund(g_selectedCharId, dummy, sizeof(dummy));
+                ApplyCharFullRefund(g_scopeFullRefund, dummy, sizeof(dummy));
             }
         }
     }
@@ -4612,43 +5021,75 @@ static void DrawBattleCustomizerTab()
 
     ImGui::BeginDisabled(!battleReady);
 
+    // 醒目作用域提示条（所见即所得：清楚区分「全体」与「单人」，且已开启的全体功能绝不因查看单人面板而失效）
+    {
+        if (g_selectedCharId[0] == 0)
+        {
+            ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.72f, 1.0f),
+                               "当前施法范围: ★ 全体罗德岛干员（新部署 / 撤退重下 / 新召唤干员 0.2s 内自动继承全部全局效果）");
+        }
+        else
+        {
+            ImGui::TextColored(ImVec4(1.00f, 0.84f, 0.35f, 1.0f),
+                               "当前施法范围: 仅针对 [%s]（已开启的【全体】功能继续自动覆盖新下干员，不受影响）",
+                               g_selectedCharLabel);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("切回全体###topAll"))
+            {
+                g_selectedCharId[0] = 0;
+                CopyStrSafe(g_selectedCharLabel, sizeof(g_selectedCharLabel), "全体罗德岛干员");
+            }
+        }
+    }
+
     // ========================================================================
     // 2. 物理法则总控台（4×3 对齐状态矩阵 + 时间法则 + 一键地爆天星超载）
     //    翠绿 = 锁定/生效中 | 亮紫 = 底层规则粉碎机激活中 | 金色 = 终极超载已激活
     // ========================================================================
     if (ImGui::BeginTable("##QuickDeck", 4, ImGuiTableFlags_SizingStretchSame))
     {
-        // Row 1: 4 项持续自动锁定（绿色常亮 = 开启中）
+        auto handleScopedLockClick = [&](volatile LONG *flag, char *scopeBuf, int scopeCap, const char *name, const char *onWord, const char *offWord) {
+            bool curOn = (InterlockedCompareExchange(flag, 0, 0) != 0);
+            bool upgradeGlobal = (curOn && scopeBuf[0] != 0 && g_selectedCharId[0] == 0);
+            if (!curOn || upgradeGlobal)
+            {
+                CopyStrSafe(scopeBuf, scopeCap, g_selectedCharId);
+                InterlockedExchange(flag, 1);
+                if (upgradeGlobal)
+                    SetFeedback(FB_OK, "「%s」已升级为【全体模式】（新部署/重下干员自动继承）", name);
+                else
+                    SetFeedback(FB_OK, "「%s」已%s（锁定范围：%s；查看其他干员面板不串台）", name, onWord, g_selectedCharLabel);
+            }
+            else
+            {
+                InterlockedExchange(flag, 0);
+                scopeBuf[0] = 0;
+                SetFeedback(FB_INFO, "「%s」已%s", name, offWord);
+            }
+        };
+
+        // Row 1: 4 项持续自动锁定（绿色常亮 = 开启中，各自独立绑定开启时的作用域）
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         {
             bool on = (InterlockedCompareExchange(&g_lockInfAmmo, 0, 0) != 0);
             if (DrawToggleStateBtn("● 弹幕永动机 (无限弹药)###lk_ammo", "○ 弹幕永动机 (无限弹药)###lk_ammo", on, -1.0f, 28.0f))
-            {
-                InterlockedExchange(&g_lockInfAmmo, on ? 0 : 1);
-                SetFeedback(FB_OK, "「弹幕永动机 (无限弹药锁定)」已%s（目标：%s）", on ? "关闭" : "点火", g_selectedCharLabel);
-            }
-            ItemTip("持续锁定弹药类干员（如能天使/假日威龙陈/水陈等）的子弹不消耗，射到地老天荒");
+                handleScopedLockClick(&g_lockInfAmmo, g_scopeInfAmmo, sizeof(g_scopeInfAmmo), "弹幕永动机 (无限弹药)", "点火", "关闭");
+            ItemTip("持续锁定弹药类干员的子弹不消耗；记住开启时的全体/单人作用域，随手切人看面板不失效");
         }
         ImGui::TableSetColumnIndex(1);
         {
             bool on = (InterlockedCompareExchange(&g_lockInfSp, 0, 0) != 0);
             if (DrawToggleStateBtn("● 永动充电宝 (无限技力)###lk_sp", "○ 永动充电宝 (无限技力)###lk_sp", on, -1.0f, 28.0f))
-            {
-                InterlockedExchange(&g_lockInfSp, on ? 0 : 1);
-                SetFeedback(FB_OK, "「永动充电宝 (无限技力锁定)」已%s（目标：%s）", on ? "拔线" : "满充", g_selectedCharLabel);
-            }
-            ItemTip("持续把目标干员的技力条顶满，技能随便连发无需等回转");
+                handleScopedLockClick(&g_lockInfSp, g_scopeInfSp, sizeof(g_scopeInfSp), "永动充电宝 (无限技力)", "满充", "拔线");
+            ItemTip("持续把目标干员的技力条顶满；记住开启时的全体/单人作用域，新下干员自动生效");
         }
         ImGui::TableSetColumnIndex(2);
         {
             bool on = (InterlockedCompareExchange(&g_lockGodHp, 0, 0) != 0);
             if (DrawToggleStateBtn("● 金身不坏老赖 (锁血无敌)###lk_hp", "○ 金身不坏老赖 (锁血无敌)###lk_hp", on, -1.0f, 28.0f))
-            {
-                InterlockedExchange(&g_lockGodHp, on ? 0 : 1);
-                SetFeedback(FB_OK, "「金身不坏老赖 (锁血无敌)」已%s（目标：%s）", on ? "卸甲" : "开盾", g_selectedCharLabel);
-            }
-            ItemTip("持续把干员生命值锁死在 100%，站撸 Boss 纹丝不动（不卡血条 UI）");
+                handleScopedLockClick(&g_lockGodHp, g_scopeGodHp, sizeof(g_scopeGodHp), "金身不坏老赖 (锁血无敌)", "开盾", "卸甲");
+            ItemTip("持续把干员生命值锁死在 100%；记住开启时的全体/单人作用域，新下干员自动无敌");
         }
         ImGui::TableSetColumnIndex(3);
         {
@@ -5025,6 +5466,16 @@ static void DrawBattleCustomizerTab()
                 CopyStrSafe(g_enemyLabel, sizeof(g_enemyLabel), g_enemyFilter[0] ? g_enemyFilter : "全场所有倒霉蛋");
             ImGui::SameLine();
             ImGui::TextDisabled("当前改造对象: %s", g_enemyLabel);
+            ImGui::SameLine();
+            bool enmAuto = (InterlockedCompareExchange(&g_enemyAutoInherit, 0, 0) != 0);
+            if (ImGui::Checkbox("新出红门自动继承改造(含后续波次)", &enmAuto))
+            {
+                InterlockedExchange(&g_enemyAutoInherit, enmAuto ? 1 : 0);
+                SetFeedback(FB_INFO, enmAuto
+                            ? "敌方出厂流水线已接通！后续新出红门的怪物将自动继承本局已点过的沙包/定身/零重量/改属性"
+                            : "已关闭新波次自动继承：敌方改造仅作用于当前场上存活怪物");
+            }
+            ItemTip("勾选后，之后从红门新刷出来的怪物会自动套用本局已点过的敌方改造（如失重气球/沙包/定身/不扣血）");
 
             // B. 敌方 6 大快捷处置矩阵（3列×2行，整齐无溢出）+ 灭霸响指秒杀条
             if (ImGui::BeginTable("##EnemyQuickOps", 3, ImGuiTableFlags_SizingStretchSame))
