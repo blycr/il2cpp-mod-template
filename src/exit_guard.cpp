@@ -12,6 +12,7 @@
 // main.cpp 的日志内核（双写 文件 + 面板环形缓冲）
 extern void LogRaw(const char *fmt, ...);
 extern void Mod_OnGameThread();
+extern void Mod_OnMainPump();
 
 namespace
 {
@@ -102,6 +103,7 @@ LRESULT CALLBACK ExitWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             EnsureImeForTextInput(hwnd, UiWantTextInput());
             Mod_OnGameThread();
+            Mod_OnMainPump();
         }
         return 0;
     default: break;

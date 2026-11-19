@@ -401,6 +401,8 @@ static void PanelDraw()
 {
     if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_Reorderable))
     {
+        // 主功能标签置顶首屏（★ 战斗定制 + 开发工具 6合1），减少标签切换噪音
+        Mod_DrawPanelTabs();
         if (ImGui::BeginTabItem("日志"))
         {
             LogPanelDraw();
@@ -411,13 +413,11 @@ static void PanelDraw()
             PanelDrawStatus();
             ImGui::EndTabItem();
         }
-        if (MOD_TOOL_DLL[0] && ImGui::BeginTabItem("工具"))
+        if (MOD_TOOL_DLL[0] && ImGui::BeginTabItem("外部工具"))
         {
             ToolDrawInPanel();
             ImGui::EndTabItem();
         }
-        // 用户自己的 tab 追加在这里
-        Mod_DrawPanelTabs();
     }
     ImGui::EndTabBar();
 }
