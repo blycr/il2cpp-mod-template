@@ -34,7 +34,7 @@ DllMain ──CreateThread──▶ Worker 线程
 | 看日志 | 文件 + 无锁环形缓冲 + 面板实时日志（分级着色、过滤、自动滚动） |
 | 改代码 | 热重载：无需重启游戏，改完重新注入即可（含完整的逆序清理） |
 | 退出与输入 | ★ **退出守护 + 事件驱动防鼠标穿透 + 原生中文 IME**：子类化窗口过程拦截 `WM_CLOSE`/`WM_DESTROY` 抢跑清理；事件驱动 `WH_MOUSE_LL`（`WM_MOUSEMOVE` 零阻塞直通）+ `ExitWndProc` 双层屏蔽面板区域鼠标点击、滚轮与 `WM_INPUT` 穿透；输入框聚焦时动态激活 IME（`ImmAssociateContextEx` + `WM_CHAR` 队列）原生支持中文打字 |
-| 内置工具箱 | 精简 4 主 Tab 布局：首屏 `★ 物理法则改写 (战斗定制)`（全运行于 Unity 主线程顶层消息泵 `Mod_OnMainPump`、零 GC STW、含 4 项持续锁定 + 4 项可逆规则粉碎机：全地形放置/同格叠放/全图射程[含近战与复合技能]/无视地空+破隐 + 必中真伤/霸体免控/大力推拉/全额返费/零重量/刷怪/调速）+ 收拢 6 合 1 `博士实验室 (开发工具)`（`类浏览器` / `对象检查` / `字段监视` / `方法调用` / `导出Dumper` / `快捷键`） |
+| 内置工具箱 | 精简 4 主 Tab 布局：首屏 `★ 物理法则改写 (战斗定制)`（全运行于 Unity 主线程顶层消息泵 `Mod_OnMainPump`、零 GC STW、含 4 项持续锁定 + 4 项可逆规则粉碎机：全地形放置/同格叠放/全图射程[含近战与复合技能]/无视地空+破隐 + 必中真伤/霸体免控/大力推拉/全额返费/嘲讽/零重量/照妖镜/刷怪/调速 + 每功能独立作用域防串台与新部署/重下/新召唤手牌 200ms 自动继承引擎）+ 收拢 6 合 1 `博士实验室 (开发工具)`（`类浏览器` / `对象检查` / `字段监视` / `方法调用` / `导出Dumper` / `快捷键`） |
 
 ---
 
@@ -116,27 +116,28 @@ objdump -p il2cpp_mod.dll | grep -c emutls       # 必须是 0
 
 ---
 
-## 六个扩展点
+## 七个扩展点
 
 全部在 `src/user_hooks.cpp`，默认空实现 + 可跑的示例。**线程搞错就是随机崩溃**，务必按表来：
 
 | 扩展点 | 调用线程 | 用途 |
 | --- | --- | --- |
 | `Mod_OnReady()` | Worker（已 attach 域），一次 | 找类、拿单例、装你自己的钩子 |
-| `Mod_OnTick()` | Worker（已 attach 域），每秒 | 周期性读游戏状态 |
-| `Mod_OnFrame()` | **渲染线程**，每帧 | 轻量状态推进。★ 不能调 il2cpp |
-| `Mod_OnGameThread()` | **游戏逻辑线程**，每次类型查找 | ★ 唯一能安全调 il2cpp 的地方，必须自己限流 |
-| `Mod_DrawPanelTabs()` | 渲染线程 | 在面板 TabBar 里加你自己的 tab |
-| `Mod_OnShutdown()` | 注入器线程，卸载时 | 停你起的线程、还你借的资源 |
+| `Mod_OnTick()` | Worker（已 attach 域），每 100ms | 纯后台非 Unity 任务（类 Dump / Watch 缓存 / 配置落盘） |
+| `Mod_OnFrame()` | **渲染线程**，每帧 | 轻量状态推进、向主线程投递 `WM_APP+0x4D4F` 心跳。★ 不能调 il2cpp |
+| `Mod_OnMainPump()` | **Unity 主线程顶层消息泵**（`ExitWndProc`） | ★ **推荐**：全部 Unity 战斗修改、规则改写、持续锁定、刷怪、调速与零 GC 快照（绝不嵌套在 UI/FixedUpdate 内，0 闪退） |
+| `Mod_OnGameThread()` | **游戏逻辑线程**，每次类型查找 | Watch 写入与主线程任务队列派发，必须自己限流 |
+| `Mod_DrawPanelTabs()` | 渲染线程 | 在面板 TabBar 里加你自己的 tab（只画 ImGui + 写请求槽） |
+| `Mod_OnShutdown()` | 注入器线程，卸载时 | 停锁、清缓存、保存配置并还资源 |
 
 ### 最重要的模式：跨线程请求队列
 
-ImGui 按钮跑在渲染线程，而「创建 Unity 对象 / 调游戏方法」只能在游戏逻辑线程做。在按钮回调里直接调，崩点会离调用点很远，极难定位。
+ImGui 按钮跑在渲染线程，而「创建 Unity 对象 / 修改战场状态 / 调游戏方法」只能在 Unity 主线程安全执行。在按钮回调或 Worker 线程里直接调，极易触发 `CanvasUpdateRegistry` 并发崩溃且崩点极难定位。
 
 `src/user_hooks.cpp` 给了完整实现，核心是三段：
 
 ```
-渲染线程按钮回调 ──写请求──▶ volatile 请求槽 ──▶ 游戏逻辑线程 Mod_OnGameThread() 消费执行
+渲染线程按钮回调 ──写请求 + PostMessageW(WM_APP+0x4D4F)──▶ volatile 请求槽 ──▶ Unity 主线程顶层消息泵 Mod_OnMainPump() 消费执行
 ```
 
 请求槽用 `volatile` + `InterlockedXxx`。**不要用 `std::mutex` / `std::queue`** —— 它们会引入静态 TLS 与 libstdc++ 依赖，直接违反下面的硬约束。
