@@ -186,8 +186,10 @@ namespace
         Il2CppObject *tile;
         Il2CppObject *tileData;
         int32_t       origBuildableType;
+        int32_t       origAdvMask;
         uint8_t       origBlockManual;
         uint8_t       origOverlap;
+        uint8_t       origOnlyManualOverlap;
     };
 
     struct CardCondBackup
@@ -195,6 +197,7 @@ namespace
         Il2CppObject *card;
         int32_t       origBuildType;
         int32_t       origOrigBuildType;
+        int32_t       origAdvMask;
         uint8_t       origCheckManual;
         int32_t       origManualType;
         uint8_t       origExcludeWalk;
@@ -2507,6 +2510,19 @@ static void MarkMapBuildableDirty(Il2CppObject *mapObj)
     }
 }
 
+static int32_t InvokeIntGetter(Il2CppObject *obj, Il2CppClass *k, const char *getterName, int32_t fallback)
+{
+    Il2CppApi &api = ir::Api();
+    if (!obj || !k || !api.il2cpp_runtime_invoke || !api.il2cpp_object_unbox) return fallback;
+    MethodInfo *m = FindMethodWalk(k, getterName, 0);
+    if (!m) return fallback;
+    Il2CppException *exc = nullptr;
+    Il2CppObject *ret = api.il2cpp_runtime_invoke(m, obj, nullptr, &exc);
+    if (exc || !ret) return fallback;
+    int32_t *v = (int32_t *)api.il2cpp_object_unbox(ret);
+    return v ? *v : fallback;
+}
+
 static TileBackup *FindOrRecordTileBackup(Il2CppObject *tile, Il2CppClass *tk)
 {
     for (int i = 0; i < g_tileBackupCount; ++i)
@@ -2516,26 +2532,31 @@ static TileBackup *FindOrRecordTileBackup(Il2CppObject *tile, Il2CppClass *tk)
     Il2CppApi &api = ir::Api();
     FieldInfo *fData = ArkReflectFindField(tk, "m_data", nullptr);
     Il2CppObject *td = fData ? api.il2cpp_field_get_value_object(fData, tile) : nullptr;
-    int32_t origBType = 0;
+    int32_t dataBType = 0;
     if (td)
     {
         Il2CppClass *tdk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(td) : td->klass;
         if (tdk)
         {
             if (FieldInfo *fBt = ArkReflectFindField(tdk, "buildableType", nullptr))
-                if (void *a = ArkReflectFieldAddr(fBt, td)) origBType = *(int32_t *)a;
+                if (void *a = ArkReflectFieldAddr(fBt, td)) dataBType = *(int32_t *)a;
         }
     }
 
-    uint8_t origBlk = InvokeBoolGetter(tile, tk, "get_blockManuallySpawn") ? 1 : 0;
-    uint8_t origOvl = InvokeBoolGetter(tile, tk, "get_enableOverlap") ? 1 : 0;
+    int32_t origBType   = InvokeIntGetter(tile, tk, "get_buildableType", dataBType);
+    int32_t origAdvMask = InvokeIntGetter(tile, tk, "get_advancedBuildableMask", 1);
+    uint8_t origBlk     = InvokeBoolGetter(tile, tk, "get_blockManuallySpawn") ? 1 : 0;
+    uint8_t origOvl     = InvokeBoolGetter(tile, tk, "get_enableOverlap") ? 1 : 0;
+    uint8_t origOnlyMO  = InvokeBoolGetter(tile, tk, "get_onlyManuallyOverlap") ? 1 : 0;
 
     TileBackup *b = &g_tileBackups[g_tileBackupCount++];
-    b->tile              = tile;
-    b->tileData          = td;
-    b->origBuildableType = origBType;
-    b->origBlockManual   = origBlk;
-    b->origOverlap       = origOvl;
+    b->tile                  = tile;
+    b->tileData              = td;
+    b->origBuildableType     = origBType;
+    b->origAdvMask           = origAdvMask;
+    b->origBlockManual       = origBlk;
+    b->origOverlap           = origOvl;
+    b->origOnlyManualOverlap = origOnlyMO;
     return b;
 }
 
@@ -2552,6 +2573,39 @@ static void SetTileBoolProp(Il2CppObject *tile, Il2CppClass *tk, const char *set
     }
     if (FieldInfo *f = ArkReflectFindField(tk, fieldName, nullptr))
         if (void *a = ArkReflectFieldAddr(f, tile)) *(uint8_t *)a = val ? 1 : 0;
+}
+
+static void SetTileBuildableAndMask(Il2CppObject *tile, Il2CppClass *tk, Il2CppObject *tileData,
+                                    int32_t bType, int32_t advMask)
+{
+    Il2CppApi &api = ir::Api();
+    // 1) 调用原生 Tile.OverwriteBuildableType / OverwriteAdvancedBuildableMask，同步刷新 Tile.m_cachedOptions
+    if (MethodInfo *mOwBt = FindMethodWalk(tk, "OverwriteBuildableType", 1))
+    {
+        int32_t v = bType;
+        void *args[1] = { &v };
+        Il2CppException *exc = nullptr;
+        api.il2cpp_runtime_invoke(mOwBt, tile, args, &exc);
+    }
+    if (MethodInfo *mOwAdv = FindMethodWalk(tk, "OverwriteAdvancedBuildableMask", 1))
+    {
+        int32_t v = advMask;
+        void *args[1] = { &v };
+        Il2CppException *exc = nullptr;
+        api.il2cpp_runtime_invoke(mOwAdv, tile, args, &exc);
+    }
+    // 2) 同步写入 m_data.buildableType / advancedBuildableMask 作为双保险
+    if (tileData)
+    {
+        Il2CppClass *tdk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(tileData) : tileData->klass;
+        if (tdk)
+        {
+            if (FieldInfo *fBt = ArkReflectFindField(tdk, "buildableType", nullptr))
+                if (void *a = ArkReflectFieldAddr(fBt, tileData)) *(int32_t *)a = bType;
+            if (FieldInfo *fAm = ArkReflectFindField(tdk, "advancedBuildableMask", nullptr))
+                if (void *a = ArkReflectFieldAddr(fAm, tileData)) *(int32_t *)a = advMask;
+        }
+    }
 }
 
 static void ApplyRuleAllTerrain(bool enable, int *outTiles, int *outCards)
@@ -2576,15 +2630,10 @@ static void ApplyRuleAllTerrain(bool enable, int *outTiles, int *outCards)
                 if (!tk || IsProtectedSpecialTile(tile, tk)) continue;
 
                 TileBackup *bk = FindOrRecordTileBackup(tile, tk);
-                if (!bk || !bk->tileData) continue;
+                if (!bk) continue;
 
-                Il2CppClass *tdk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bk->tileData) : bk->tileData->klass;
-                if (tdk)
-                {
-                    if (FieldInfo *fBt = ArkReflectFindField(tdk, "buildableType", nullptr))
-                        if (void *a = ArkReflectFieldAddr(fBt, bk->tileData))
-                            *(int32_t *)a = 3; // BuildableType.ALL
-                }
+                // BuildableType.ALL(3) + AdvancedBuildableMask.DEFAULT(1)（解除深海/红雾/禁区等特殊地形限制）
+                SetTileBuildableAndMask(tile, tk, bk->tileData, 3, 1);
                 SetTileBoolProp(tile, tk, "set_blockManuallySpawn", "m_blockManuallySpawn", false);
                 ++tHit;
             }
@@ -2623,6 +2672,7 @@ static void ApplyRuleAllTerrain(bool enable, int *outTiles, int *outCards)
                     if (void *sb = ArkReflectFieldAddr(fCond, card))
                     {
                         if (void *p = StructMemberAddr(sb, condK, "buildableType"))              cb->origBuildType      = *(int32_t *)p;
+                        if (void *p = StructMemberAddr(sb, condK, "advancedBuildableMask"))      cb->origAdvMask        = *(int32_t *)p;
                         if (void *p = StructMemberAddr(sb, condK, "checkManuallyBuildableType")) cb->origCheckManual    = *(uint8_t *)p;
                         if (void *p = StructMemberAddr(sb, condK, "manuallyBuildableType"))      cb->origManualType     = *(int32_t *)p;
                         if (void *p = StructMemberAddr(sb, condK, "_excludeOccupiedByWalkEnemy"))cb->origExcludeWalk    = *(uint8_t *)p;
@@ -2640,7 +2690,8 @@ static void ApplyRuleAllTerrain(bool enable, int *outTiles, int *outCards)
                 if (!f) return;
                 void *sb = ArkReflectFieldAddr(f, card);
                 if (!sb) return;
-                if (void *p = StructMemberAddr(sb, condK, "buildableType"))               *(int32_t *)p = 3; // ALL
+                if (void *p = StructMemberAddr(sb, condK, "buildableType"))               *(int32_t *)p = 3;     // ALL
+                if (void *p = StructMemberAddr(sb, condK, "advancedBuildableMask"))       *(int32_t *)p = 0x7FF; // 全特殊地块通行
                 if (void *p = StructMemberAddr(sb, condK, "checkManuallyBuildableType"))  *(uint8_t *)p = 0;
                 if (void *p = StructMemberAddr(sb, condK, "manuallyBuildableType"))       *(int32_t *)p = 3;
                 if (void *p = StructMemberAddr(sb, condK, "_excludeOccupiedByWalkEnemy")) *(uint8_t *)p = 0;
@@ -2654,24 +2705,17 @@ static void ApplyRuleAllTerrain(bool enable, int *outTiles, int *outCards)
     }
     else
     {
-        // 关闭时精确还原每个地块的原始可部署类型与手动禁放标记
+        // 关闭时精确还原每个地块的原始可部署类型、特殊掩码与手动禁放标记
         for (int i = 0; i < g_tileBackupCount; ++i)
         {
             TileBackup &bk = g_tileBackups[i];
             if (!bk.tile || !IsUnityObjAlive(bk.tile)) continue;
             Il2CppClass *tk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bk.tile) : bk.tile->klass;
-            if (bk.tileData)
-            {
-                Il2CppClass *tdk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bk.tileData) : bk.tileData->klass;
-                if (tdk)
-                {
-                    if (FieldInfo *fBt = ArkReflectFindField(tdk, "buildableType", nullptr))
-                        if (void *a = ArkReflectFieldAddr(fBt, bk.tileData))
-                            *(int32_t *)a = bk.origBuildableType;
-                }
-            }
             if (tk)
+            {
+                SetTileBuildableAndMask(bk.tile, tk, bk.tileData, bk.origBuildableType, bk.origAdvMask);
                 SetTileBoolProp(bk.tile, tk, "set_blockManuallySpawn", "m_blockManuallySpawn", bk.origBlockManual != 0);
+            }
             ++tHit;
         }
         // 还原手牌 BuildCondition
@@ -2694,6 +2738,7 @@ static void ApplyRuleAllTerrain(bool enable, int *outTiles, int *outCards)
                 if (void *sb = ArkReflectFieldAddr(fCond, cb.card))
                 {
                     if (void *p = StructMemberAddr(sb, condK, "buildableType"))               *(int32_t *)p = cb.origBuildType;
+                    if (void *p = StructMemberAddr(sb, condK, "advancedBuildableMask"))       *(int32_t *)p = cb.origAdvMask;
                     if (void *p = StructMemberAddr(sb, condK, "checkManuallyBuildableType"))  *(uint8_t *)p = cb.origCheckManual;
                     if (void *p = StructMemberAddr(sb, condK, "manuallyBuildableType"))       *(int32_t *)p = cb.origManualType;
                     if (void *p = StructMemberAddr(sb, condK, "_excludeOccupiedByWalkEnemy")) *(uint8_t *)p = cb.origExcludeWalk;
@@ -2738,6 +2783,7 @@ static void ApplyRuleOverlap(bool enable, int *outTiles)
                 if (!tk || IsProtectedSpecialTile(tile, tk)) continue;
                 FindOrRecordTileBackup(tile, tk);
                 SetTileBoolProp(tile, tk, "set_enableOverlap", "m_enableOverlap", true);
+                SetTileBoolProp(tile, tk, "set_onlyManuallyOverlap", "m_onlyManuallyOverlap", false);
                 ++tHit;
             }
             MarkMapBuildableDirty(mapObj);
@@ -2753,6 +2799,7 @@ static void ApplyRuleOverlap(bool enable, int *outTiles)
             if (tk)
             {
                 SetTileBoolProp(bk.tile, tk, "set_enableOverlap", "m_enableOverlap", bk.origOverlap != 0);
+                SetTileBoolProp(bk.tile, tk, "set_onlyManuallyOverlap", "m_onlyManuallyOverlap", bk.origOnlyManualOverlap != 0);
                 ++tHit;
             }
         }
@@ -2763,7 +2810,79 @@ static void ApplyRuleOverlap(bool enable, int *outTiles)
     if (outTiles) *outTiles = tHit;
 }
 
-// 零 GC 收集干员身上全部 RangeSelector（跳过 BlockedSelector / SelfSelector）
+// 递归收集 RangeSelector（完整覆盖远程 AdvancedSelector + 95% 近战 BlockedOrAdvancedSelector/BlockedAndAdvancedSelector
+// + 复合容器 GroupSelector / SequenceGroupSelector / ParallelGroupSelector；由 is_assignable_from 自动排除无射程的纯 BlockedSelector/SelfSelector）
+static void CollectRangeSelectorRec(Il2CppObject *sel, Il2CppClass *rsKlass, Il2CppObject **outSels, int maxOut, int *found, int depth)
+{
+    if (!sel || !rsKlass || !outSels || !found || *found >= maxOut || depth > 3 || !IsUnityObjAlive(sel))
+        return;
+    Il2CppApi &api = ir::Api();
+    Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(sel) : sel->klass;
+    if (!sk) return;
+
+    // 关键：必须继承自 RangeSelector（自带 m_range 与 m_targetOptions），
+    // 自动安全排除直接继承 TargetSelector 的纯 BlockedSelector / SelfSelector，
+    // 同时完整保留所有近战干员的 BlockedOrAdvancedSelector / BlockedAndAdvancedSelector / BlockedOrRandomSelector！
+    if (api.il2cpp_class_is_assignable_from && !api.il2cpp_class_is_assignable_from(rsKlass, sk))
+        return;
+
+    bool dup = false;
+    for (int i = 0; i < *found; ++i)
+        if (outSels[i] == sel) { dup = true; break; }
+    if (!dup)
+        outSels[(*found)++] = sel;
+
+    // 展开复合选择器内部子选择器（GroupSelector / SequenceGroupSelector / ParallelGroupSelector）
+    if (FieldInfo *fList = ArkReflectFindField(sk, "_rangeSelectorsList", nullptr))
+    {
+        if (Il2CppObject *listObj = api.il2cpp_field_get_value_object(fList, sel))
+        {
+            Il2CppClass *lk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(listObj) : listObj->klass;
+            if (lk)
+            {
+                FieldInfo *fItems = ArkReflectFindField(lk, "_items", nullptr);
+                FieldInfo *fSize  = ArkReflectFindField(lk, "_size", nullptr);
+                if (fItems && fSize)
+                {
+                    int32_t sz = 0;
+                    if (void *a = ArkReflectFieldAddr(fSize, listObj)) sz = *(int32_t *)a;
+                    if (sz > 0 && sz <= 32)
+                    {
+                        if (Il2CppObject *arr = api.il2cpp_field_get_value_object(fItems, listObj))
+                        {
+                            int32_t arrLen = *(int32_t *)((char *)arr + 0x18);
+                            int32_t take = (sz < arrLen) ? sz : arrLen;
+                            Il2CppObject **items = (Il2CppObject **)((char *)arr + 0x20);
+                            for (int i = 0; i < take && *found < maxOut; ++i)
+                                CollectRangeSelectorRec(items[i], rsKlass, outSels, maxOut, found, depth + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (FieldInfo *fArr = ArkReflectFindField(sk, "_selectorGroup", nullptr))
+    {
+        if (Il2CppObject *arr = api.il2cpp_field_get_value_object(fArr, sel))
+        {
+            int32_t arrLen = *(int32_t *)((char *)arr + 0x18);
+            if (arrLen > 0 && arrLen <= 32)
+            {
+                Il2CppObject **items = (Il2CppObject **)((char *)arr + 0x20);
+                for (int i = 0; i < arrLen && *found < maxOut; ++i)
+                    CollectRangeSelectorRec(items[i], rsKlass, outSels, maxOut, found, depth + 1);
+            }
+        }
+    }
+    static const char *kChildSelFields[] = { "_overrideSelector", "_firstOrderSelector", "_appendOrderSelector" };
+    for (int fi = 0; fi < 3 && *found < maxOut; ++fi)
+    {
+        if (FieldInfo *fc = ArkReflectFindField(sk, kChildSelFields[fi], nullptr))
+            CollectRangeSelectorRec(api.il2cpp_field_get_value_object(fc, sel), rsKlass, outSels, maxOut, found, depth + 1);
+    }
+}
+
+// 零 GC 收集干员身上全部 RangeSelector（普攻 + 形态切换/技能覆写攻击 + 战斗能力 + 技能 + 缓存能力）
 static int CollectCharRangeSelectors(Il2CppObject *chr, Il2CppClass *ck, Il2CppObject **outSels, int maxOut)
 {
     if (!chr || !ck || !outSels || maxOut <= 0) return 0;
@@ -2774,17 +2893,21 @@ static int CollectCharRangeSelectors(Il2CppObject *chr, Il2CppClass *ck, Il2CppO
 
     int found = 0;
     auto addSel = [&](Il2CppObject *sel) {
-        if (!sel || found >= maxOut || !IsUnityObjAlive(sel)) return;
-        Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(sel) : sel->klass;
-        if (!sk) return;
-        if (api.il2cpp_class_is_assignable_from && !api.il2cpp_class_is_assignable_from(rsKlass, sk))
-            return;
-        const char *sn = api.il2cpp_class_get_name ? api.il2cpp_class_get_name(sk) : nullptr;
-        if (sn && (strstr(sn, "Blocked") || strstr(sn, "Self")))
-            return;
-        for (int i = 0; i < found; ++i)
-            if (outSels[i] == sel) return;
-        outSels[found++] = sel;
+        CollectRangeSelectorRec(sel, rsKlass, outSels, maxOut, &found, 0);
+    };
+
+    auto addFromTrigger = [&](Il2CppObject *trig) {
+        if (!trig) return;
+        Il2CppClass *tk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(trig) : trig->klass;
+        if (!tk) return;
+        if (FieldInfo *fSel = ArkReflectFindField(tk, "m_selector", nullptr))
+            addSel(api.il2cpp_field_get_value_object(fSel, trig));
+        if (MethodInfo *mGs = FindMethodWalk(tk, "get_selector", 0))
+        {
+            Il2CppException *e2 = nullptr;
+            Il2CppObject *s = api.il2cpp_runtime_invoke(mGs, trig, nullptr, &e2);
+            if (!e2 && s) addSel(s);
+        }
     };
 
     auto addFromAbility = [&](Il2CppObject *ab) {
@@ -2801,34 +2924,32 @@ static int CollectCharRangeSelectors(Il2CppObject *chr, Il2CppClass *ck, Il2CppO
         }
     };
 
-    // 1) Unit.get_attackTrigger() -> SelectorTrigger.m_selector / get_selector()
+    // 1) Unit.get_attackTrigger() & m_overrideTrigger
     if (MethodInfo *mTrig = FindMethodWalk(ck, "get_attackTrigger", 0))
     {
         Il2CppException *exc = nullptr;
         Il2CppObject *trig = api.il2cpp_runtime_invoke(mTrig, chr, nullptr, &exc);
-        if (!exc && trig)
+        if (!exc && trig) addFromTrigger(trig);
+    }
+    if (FieldInfo *fOvTrig = ArkReflectFindField(ck, "m_overrideTrigger", nullptr))
+        addFromTrigger(api.il2cpp_field_get_value_object(fOvTrig, chr));
+
+    // 2) Unit.get_attack() / get_combat() / m_overrideAttack / m_overrideCombat / Character.m_skill
+    static const char *kAbGetters[] = { "get_attack", "get_combat" };
+    for (int gi = 0; gi < 2 && found < maxOut; ++gi)
+    {
+        if (MethodInfo *mAb = FindMethodWalk(ck, kAbGetters[gi], 0))
         {
-            Il2CppClass *tk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(trig) : trig->klass;
-            if (tk)
-            {
-                if (FieldInfo *fSel = ArkReflectFindField(tk, "m_selector", nullptr))
-                    addSel(api.il2cpp_field_get_value_object(fSel, trig));
-                if (MethodInfo *mGs = FindMethodWalk(tk, "get_selector", 0))
-                {
-                    Il2CppException *e2 = nullptr;
-                    Il2CppObject *s = api.il2cpp_runtime_invoke(mGs, trig, nullptr, &e2);
-                    if (!e2 && s) addSel(s);
-                }
-            }
+            Il2CppException *exc = nullptr;
+            Il2CppObject *ab = api.il2cpp_runtime_invoke(mAb, chr, nullptr, &exc);
+            if (!exc && ab) addFromAbility(ab);
         }
     }
-
-    // 2) Unit.get_attack() -> Ability._selector
-    if (MethodInfo *mAtk = FindMethodWalk(ck, "get_attack", 0))
+    static const char *kAbFields[] = { "m_overrideAttack", "m_overrideCombat", "m_skill" };
+    for (int fi = 0; fi < 3 && found < maxOut; ++fi)
     {
-        Il2CppException *exc = nullptr;
-        Il2CppObject *ab = api.il2cpp_runtime_invoke(mAtk, chr, nullptr, &exc);
-        if (!exc && ab) addFromAbility(ab);
+        if (FieldInfo *fAb = ArkReflectFindField(ck, kAbFields[fi], nullptr))
+            addFromAbility(api.il2cpp_field_get_value_object(fAb, chr));
     }
 
     // 3) Entity.m_cachedAbilities (List<Ability>) -> 各技能/天赋的能力选择器
@@ -3250,6 +3371,7 @@ static int ApplyCharFullRefund(const char *filter, char *lastMatched, int cap)
     FieldInfo *fRat1  = ArkReflectFindField(ce->klass, "_withdrawCostRecoverRatio", nullptr);
     FieldInfo *fRat2  = ArkReflectFindField(ce->klass, "_maxWithdrawCostRatioOfRawCost", nullptr);
     FieldInfo *fRatM  = ArkReflectFindField(ce->klass, "m_withdrawCostRecoverRatio", nullptr);
+    FieldInfo *fLimM  = ArkReflectFindField(ce->klass, "m_limitMaxWithdrawCostByDeployUse", nullptr);
     MethodInfo *mSetR = FindMethodWalk(ce->klass, "SetWithdrawCostRecoverRatio", 3);
 
     int hit = 0;
@@ -3276,6 +3398,11 @@ static int ApplyCharFullRefund(const char *filter, char *lastMatched, int cap)
         {
             if (void *a = ArkReflectFieldAddr(fRat2, chr))
                 if (fabsf(*(float *)a - 1.0f) > 0.01f) { *(float *)a = 1.0f; needWrite = true; }
+        }
+        if (fLimM)
+        {
+            if (void *a = ArkReflectFieldAddr(fLimM, chr))
+                if (*(uint8_t *)a != 0) { *(uint8_t *)a = 0; needWrite = true; }
         }
         if (mSetR && needWrite)
         {
@@ -4563,21 +4690,21 @@ static void DrawBattleCustomizerTab()
             bool on = (InterlockedCompareExchange(&g_ruleAllTerrain, 0, 0) != 0);
             if (DrawRuleToggleBtn("★ 违章乱建 (全地形放置)###rl_ter", "○ 违章乱建 (全地形放置)###rl_ter", on, -1.0f, 28.0f))
                 PostRequestEx(REQ_TOGGLE_ALL_TERRAIN, "", 0, 0.0f);
-            ItemTip("放开全图地块放置限制：近战上高台、狙击站地板、禁区/坑洞随便摆（自动保护红门/蓝门/传送门，再点可还原）");
+            ItemTip("调用原生 Tile.OverwriteBuildableType/AdvancedBuildableMask 放开全图地块与特殊地形(深海/红雾/禁区)放置限制：近战上高台、狙击站地板随便摆（自动保护红蓝门/传送门，再点一键还原）");
         }
         ImGui::TableSetColumnIndex(1);
         {
             bool on = (InterlockedCompareExchange(&g_ruleOverlap, 0, 0) != 0);
             if (DrawRuleToggleBtn("★ 叠罗汉 (同格无限叠放)###rl_ovl", "○ 叠罗汉 (同格无限叠放)###rl_ovl", on, -1.0f, 28.0f))
                 PostRequestEx(REQ_TOGGLE_OVERLAP, "", 0, 0.0f);
-            ItemTip("允许在同一个格子上叠加部署多名干员，把十个大爹塞进一个格子里（再点可还原）");
+            ItemTip("允许在同一个格子上叠加部署多名干员，把十个大爹塞进一个格子里（再点一键还原）");
         }
         ImGui::TableSetColumnIndex(2);
         {
             bool on = (InterlockedCompareExchange(&g_ruleGlobalRange, 0, 0) != 0);
             if (DrawRuleToggleBtn("★ 洲际导弹 (全图射程)###rl_rng", "○ 洲际导弹 (全图射程)###rl_rng", on, -1.0f, 28.0f))
                 PostRequestEx(REQ_TOGGLE_GLOBAL_RANGE, g_selectedCharId, 0, 0.0f);
-            ItemTip("为选定干员挂载游戏原生全图射程组件 GlobalRange，普攻与技能指哪打哪（新下干员自动继承，再点可还原原射程）");
+            ItemTip("远程与近战(BlockedOrAdvancedSelector)及复合技能通通挂载游戏原生 GlobalRange 全图射程：有怪贴脸优先砍阻挡，没怪贴脸全图隔山打牛（新下干员与开技能自动继承，再点还原）");
         }
         ImGui::TableSetColumnIndex(3);
         {
