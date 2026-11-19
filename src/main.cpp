@@ -117,7 +117,9 @@ static const wchar_t *PickLogDir(wchar_t *out, int cap)
         return out;
     if (GetEnvironmentVariableW(L"IL2CPP_TEST_DIR", out, cap) > 0)
         return out;
-    if (GetFileAttributesW(MOD_FIXED_RUNTIME_DIR) != INVALID_FILE_ATTRIBUTES)
+    if (GetEnvironmentVariableW(L"MAP_DLL_DIR", out, cap) > 0)
+        return out;
+    if (MOD_FIXED_RUNTIME_DIR[0] && GetFileAttributesW(MOD_FIXED_RUNTIME_DIR) != INVALID_FILE_ATTRIBUTES)
     {
         wcscpy_s(out, cap, MOD_FIXED_RUNTIME_DIR);
         return out;

@@ -43,6 +43,12 @@ static void EnsureDir()
     }
     if (!dir[0] && GetEnvironmentVariableW(MOD_DIR_ENV, dir, MAX_PATH) == 0)
         dir[0] = 0;
+    if (!dir[0] && GetEnvironmentVariableW(L"IL2CPP_TEST_DIR", dir, MAX_PATH) == 0)
+        dir[0] = 0;
+    if (!dir[0] && GetEnvironmentVariableW(L"MAP_DLL_DIR", dir, MAX_PATH) == 0)
+        dir[0] = 0;
+    if (!dir[0] && MOD_FIXED_RUNTIME_DIR[0] && GetFileAttributesW(MOD_FIXED_RUNTIME_DIR) != INVALID_FILE_ATTRIBUTES)
+        wcscpy_s(dir, MAX_PATH, MOD_FIXED_RUNTIME_DIR);
     if (!dir[0] && GetCurrentDirectoryW(MAX_PATH, dir) == 0)
         dir[0] = 0;
     if (!dir[0] && GetTempPathW(MAX_PATH, dir) == 0)

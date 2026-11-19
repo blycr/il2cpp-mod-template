@@ -3,13 +3,26 @@
 #   .\build.ps1            增量构建（对象已存在且依赖没变则跳过）
 #   .\build.ps1 -Clean     先清 build/ 再全量构建
 #
-# 依赖：mingw-w64。默认 D:/mingw64，可用环境变量 MINGW 覆盖。
+# 依赖：mingw-w64。自动探测 MINGW 环境变量 / PATH / 常见安装目录。
 param([switch]$Clean)
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-$MINGW  = if ($env:MINGW) { $env:MINGW } elseif (Test-Path "D:/mingw64") { "D:/mingw64" } else { "C:/msys64/mingw64" }
+$MINGW = $null
+if ($env:MINGW -and (Test-Path "$($env:MINGW)/bin/x86_64-w64-mingw32-g++.exe")) {
+    $MINGW = $env:MINGW
+} else {
+    $cmdGxx = Get-Command "x86_64-w64-mingw32-g++.exe" -ErrorAction SilentlyContinue
+    if ($cmdGxx) {
+        $MINGW = Split-Path (Split-Path $cmdGxx.Source -Parent) -Parent
+    } else {
+        foreach ($cand in @("C:/msys64/mingw64", "D:/mingw64", "C:/mingw64")) {
+            if (Test-Path "$cand/bin/x86_64-w64-mingw32-g++.exe") { $MINGW = $cand; break }
+        }
+    }
+}
+if (-not $MINGW) { $MINGW = "C:/msys64/mingw64" }
 $CXX    = "$MINGW/bin/x86_64-w64-mingw32-g++.exe"
 $CC     = "$MINGW/bin/x86_64-w64-mingw32-gcc.exe"
 $IL2CPP = "il2cpp_core"
