@@ -61,11 +61,20 @@ namespace
         char msg[320];
     };
 
+    enum BattlePhase
+    {
+        PHASE_LOBBY    = 0,  // 主界面 / 登录 / 选关（无 BattleController）
+        PHASE_LOADING  = 1,  // 关卡初始化中（m_state = NONE / INITED_BUT_NOT_START）
+        PHASE_PLAYING  = 2,  // 战斗进行中（m_state = PLAYING，唯一合法修改窗口）
+        PHASE_FINISHED = 3,  // 战斗已结算（m_state = FINISHED，禁止修改）
+    };
+
     enum ReqKind
     {
         REQ_NONE = 0,
         REQ_DUMP_CLASS,
         REQ_SCAN_ROSTER,          // 立即刷新本局编队干员 & 怪物快照
+        REQ_RESET_SESSION,        // 一键复位本局状态（关全锁 + 选全体 + 恢复 1x 速度 + 刷快照）
         REQ_MOD_CARD_COST,        // 手牌 0 费部署 + 刷新 UI
         REQ_MOD_CARD_RESPAWN,     // 秒清手牌再部署冷却
         REQ_MOD_DEPLOY_LIMIT,     // 解除部署人数上限（手牌不占部署数 + 战场上调至 99）
@@ -166,6 +175,13 @@ namespace
     volatile LONG g_reqDone      = 0;
     unsigned      g_tickCounter  = 0;
     volatile LONG g_inBattle     = 0;
+    volatile LONG g_battlePhase  = PHASE_LOBBY;
+    volatile LONG g_isAutoReplay = 0;
+    volatile LONG g_battleSessId = 0;
+    volatile LONG g_autoResetNew = 1;       // 默认开启：切关 / 重开 / 代理指挥自动清锁与旧目标，防脏状态
+    Il2CppObject *g_lastBcPtr    = nullptr;
+    uint32_t      g_lastFrameCnt = 0;
+    char          g_curLevelId[96] = { 0 };
     volatile LONG g_snapLock     = 0;
     volatile LONG g_fbLock       = 0;
 
@@ -837,6 +853,177 @@ static Il2CppObject *GetBattleControllerFast()
     return nullptr;
 }
 
+// 零 GC 停顿读取 BattleController 当前阶段/代理指挥状态/关卡ID/逻辑帧
+static void ReadBattleControllerMeta(Il2CppObject *bc, int32_t *outState, bool *outAutoReplay,
+                                     char *outLevelId, int lvlCap, uint32_t *outFrameCnt)
+{
+    if (outState)      *outState = 0;
+    if (outAutoReplay) *outAutoReplay = false;
+    if (outLevelId && lvlCap > 0) outLevelId[0] = 0;
+    if (outFrameCnt)   *outFrameCnt = 0;
+    if (!bc) return;
+
+    Il2CppApi &api = ir::Api();
+    Il2CppClass *bk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bc) : bc->klass;
+    if (!bk) return;
+
+    if (outState)
+    {
+        if (FieldInfo *fSt = ArkReflectFindField(bk, "m_state", nullptr))
+            if (void *a = ArkReflectFieldAddr(fSt, bc)) *outState = *(int32_t *)a;
+    }
+    if (outAutoReplay)
+    {
+        if (FieldInfo *fRep = ArkReflectFindField(bk, "m_isAutoReplayOn", nullptr))
+            if (void *a = ArkReflectFieldAddr(fRep, bc)) *outAutoReplay = (*(uint8_t *)a != 0);
+    }
+    if (outLevelId && lvlCap > 0)
+    {
+        if (FieldInfo *fLvlId = ArkReflectFindField(bk, "<levelId>k__BackingField", nullptr))
+            Il2CppStrToUtf8(api.il2cpp_field_get_value_object(fLvlId, bc), outLevelId, lvlCap);
+    }
+    if (outFrameCnt && api.il2cpp_field_static_get_value)
+    {
+        if (FieldInfo *fFrm = ArkReflectFindField(bk, "s_fixedFrameCnt", nullptr))
+        {
+            uint32_t frm = 0;
+            api.il2cpp_field_static_get_value(fFrm, &frm);
+            *outFrameCnt = frm;
+        }
+    }
+}
+
+// 清理上一局残留状态（防脏目标/脏怪物ID/脏持续锁定带入下一场对战）
+static void ResetPerBattleState(bool clearLocks)
+{
+    if (clearLocks)
+    {
+        InterlockedExchange(&g_lockInfAmmo, 0);
+        InterlockedExchange(&g_lockInfSp, 0);
+        InterlockedExchange(&g_lockGodHp, 0);
+        InterlockedExchange(&g_lockBattleDp, 0);
+    }
+    SpinLock(&g_snapLock);
+    g_selectedCharId[0] = 0;
+    CopyStrSafe(g_selectedCharLabel, sizeof(g_selectedCharLabel), "全体编队干员");
+    g_charSearch[0] = 0;
+    g_enemyFilter[0] = 0;
+    CopyStrSafe(g_enemyLabel, sizeof(g_enemyLabel), "全场所有怪物");
+    g_spawnEnemyKey[0] = 0;
+    g_customTimeScale = 1.0f;
+    g_stageCharCount = 0;
+    g_liveEnemyCount = 0;
+    g_liveEnemyTotal = 0;
+    SpinUnlock(&g_snapLock);
+    InterlockedExchange(&g_stageEnemyCount, 0);
+    InterlockedExchange(&g_stageRouteCount, 0);
+}
+
+static bool HasAnyLockActive()
+{
+    return g_lockInfAmmo || g_lockInfSp || g_lockGodHp || g_lockBattleDp;
+}
+
+static void RefreshBattleSnapshot();
+
+// 对战生命周期与脏状态守卫（每 100ms 由 Worker 线程运行，零 GC 停顿）
+static void PollBattleSessionGuard()
+{
+    Il2CppObject *bc = GetBattleControllerFast();
+    int32_t st = 0;
+    bool autoRep = false;
+    char lvlId[96] = { 0 };
+    uint32_t frameCnt = 0;
+    if (bc)
+        ReadBattleControllerMeta(bc, &st, &autoRep, lvlId, sizeof(lvlId), &frameCnt);
+
+    BattlePhase newPhase = PHASE_LOBBY;
+    if (bc)
+    {
+        if (st == 2)      newPhase = PHASE_PLAYING;
+        else if (st == 3) newPhase = PHASE_FINISHED;
+        else              newPhase = PHASE_LOADING;
+    }
+
+    const BattlePhase prevPhase = (BattlePhase)InterlockedExchange(&g_battlePhase, (LONG)newPhase);
+    const bool prevAutoRep = (InterlockedExchange(&g_isAutoReplay, autoRep ? 1 : 0) != 0);
+    InterlockedExchange(&g_inBattle, (newPhase == PHASE_PLAYING) ? 1 : 0);
+
+    // 1) 战斗结束或返回大厅 -> 立即停止脏锁定并清理本局快照缓存
+    if (prevPhase == PHASE_PLAYING && (newPhase == PHASE_FINISHED || newPhase == PHASE_LOBBY))
+    {
+        const bool hadLocks = HasAnyLockActive();
+        const bool autoClr = (InterlockedCompareExchange(&g_autoResetNew, 0, 0) != 0);
+        ResetPerBattleState(autoClr);
+        if (newPhase == PHASE_FINISHED)
+            SetFeedback(FB_INFO, hadLocks && autoClr
+                        ? "本场战斗已结算：已自动关闭全部持续锁定并清理本局缓存"
+                        : "本场战斗已结算：修改功能已自动锁定，进入下一关后重新解锁");
+        else
+            SetFeedback(FB_INFO, hadLocks && autoClr
+                        ? "已返回主界面：已自动关闭持续锁定并重置目标，防止脏状态带入下一局"
+                        : "已返回主界面：Mod 保持待命，进入任意战斗关卡后自动解锁");
+        if (newPhase == PHASE_LOBBY)
+        {
+            g_lastBcPtr = nullptr;
+            g_lastFrameCnt = 0;
+            g_curLevelId[0] = 0;
+        }
+        return;
+    }
+
+    // 2) 进入全新战斗（换关 / 重开 / 肉鸽下一节点 / 撤退重进 / 逻辑帧归零）
+    if (newPhase == PHASE_PLAYING)
+    {
+        const bool isNewSession =
+            (bc != g_lastBcPtr) ||
+            (prevPhase != PHASE_PLAYING) ||
+            (lvlId[0] && g_curLevelId[0] && strcmp(lvlId, g_curLevelId) != 0) ||
+            (g_lastFrameCnt > 30 && frameCnt < g_lastFrameCnt);
+
+        if (isNewSession)
+        {
+            LONG sid = InterlockedIncrement(&g_battleSessId);
+            const bool autoClr = (InterlockedCompareExchange(&g_autoResetNew, 0, 0) != 0);
+            const bool mustClearLocks = autoClr || autoRep;
+            ResetPerBattleState(mustClearLocks);
+
+            g_lastBcPtr = bc;
+            CopyStrSafe(g_curLevelId, sizeof(g_curLevelId), lvlId);
+            g_lastFrameCnt = frameCnt;
+
+            if (autoRep)
+                SetFeedback(FB_WARN, "已进入第 #%ld 局 [%s]（代理指挥录像中）：为防破坏代理轴，已自动关闭所有持续锁定！",
+                            (long)sid, lvlId[0] ? lvlId : "战斗关卡");
+            else
+                SetFeedback(FB_OK, "已进入第 #%ld 局 [%s]：战斗定制已解锁，并已自动清理上一局目标与残留状态",
+                            (long)sid, lvlId[0] ? lvlId : "战斗关卡");
+
+            // 进入新局后立刻拉取一次编队与怪物库（无需等面板打开再等 1.5s）
+            RefreshBattleSnapshot();
+        }
+        else
+        {
+            g_lastFrameCnt = frameCnt;
+            if (!prevAutoRep && autoRep && HasAnyLockActive())
+            {
+                InterlockedExchange(&g_lockInfAmmo, 0);
+                InterlockedExchange(&g_lockInfSp, 0);
+                InterlockedExchange(&g_lockGodHp, 0);
+                InterlockedExchange(&g_lockBattleDp, 0);
+                SetFeedback(FB_WARN, "检测到切换为代理指挥模式：已自动暂停持续锁定，避免影响录像结算");
+            }
+        }
+    }
+    else if (newPhase == PHASE_LOBBY && g_lastBcPtr != nullptr)
+    {
+        g_lastBcPtr = nullptr;
+        g_lastFrameCnt = 0;
+        g_curLevelId[0] = 0;
+        ResetPerBattleState(InterlockedCompareExchange(&g_autoResetNew, 0, 0) != 0);
+    }
+}
+
 static int ScanStageEnemies()
 {
     Il2CppApi &api = ir::Api();
@@ -915,10 +1102,12 @@ static int ScanStageEnemies()
 static void RefreshBattleSnapshot()
 {
     Il2CppApi &api = ir::Api();
-    bool inBattle = (GetBattleControllerFast() != nullptr);
+    Il2CppObject *bc = GetBattleControllerFast();
+    int32_t st = 0;
+    if (bc) ReadBattleControllerMeta(bc, &st, nullptr, nullptr, 0, nullptr);
+    const bool playing = (bc != nullptr && st == 2);
 
-    bool wasInBattle = (InterlockedExchange(&g_inBattle, inBattle ? 1 : 0) != 0);
-    if (!inBattle)
+    if (!playing)
     {
         SpinLock(&g_snapLock);
         g_stageCharCount = 0;
@@ -930,7 +1119,7 @@ static void RefreshBattleSnapshot()
     }
 
     // 刚进入新关卡时自动拉取本关可用怪物列表（无需手动再点按钮）
-    if (!wasInBattle || g_stageEnemyCount <= 0)
+    if (g_stageEnemyCount <= 0)
         ScanStageEnemies();
 
     StageCharInfo tmpChars[32];
@@ -1635,18 +1824,12 @@ static int ApplyEnemyKill(const char *filter, char *lastMatched, int cap)
 // ============================================================================
 static void PumpPersistentLocks()
 {
-    if (!g_inBattle) return;
+    if (InterlockedCompareExchange(&g_battlePhase, 0, 0) != PHASE_PLAYING)
+        return;
 
     const bool lockAmmo = InterlockedCompareExchange(&g_lockInfAmmo, 0, 0) != 0;
     const bool lockSp   = InterlockedCompareExchange(&g_lockInfSp, 0, 0) != 0;
     const bool lockHp   = InterlockedCompareExchange(&g_lockGodHp, 0, 0) != 0;
-    const bool lockDp   = InterlockedCompareExchange(&g_lockBattleDp, 0, 0) != 0;
-
-    if (!lockAmmo && !lockSp && !lockHp && !lockDp)
-        return;
-
-    if (lockDp)
-        ApplyBattleDp(99);
 
     if (!lockAmmo && !lockSp && !lockHp)
         return;
@@ -1725,9 +1908,12 @@ static void MainThreadSpawnEnemyTask(void *ud)
     ir::EnsureAttached();
 
     Il2CppObject *bc = ctx->bcHandle ? ArkGcTarget(ctx->bcHandle) : nullptr;
-    if (!bc)
+    int32_t bcState = 0;
+    if (bc) ReadBattleControllerMeta(bc, &bcState, nullptr, nullptr, 0, nullptr);
+    if (!bc || bc != GetBattleControllerFast() || bcState != 2)
     {
-        SetFeedback(FB_ERR, "刷怪失败：BattleController 句柄已失效（可能已退出关卡）");
+        if (ctx->bcHandle) ArkGcUnpin(ctx->bcHandle);
+        SetFeedback(FB_WARN, "刷怪已取消：当前战斗已结束或尚未进入 PLAYING 状态");
         InterlockedExchange(&g_mainSpawnBusy, 0);
         return;
     }
@@ -1858,9 +2044,12 @@ static void MainThreadBattleSpeedTask(void *ud)
     ir::EnsureAttached();
 
     Il2CppObject *bc = ctx->bcHandle ? ArkGcTarget(ctx->bcHandle) : nullptr;
-    if (!bc)
+    int32_t bcState = 0;
+    if (bc) ReadBattleControllerMeta(bc, &bcState, nullptr, nullptr, 0, nullptr);
+    if (!bc || bc != GetBattleControllerFast() || bcState != 2)
     {
-        SetFeedback(FB_ERR, "调速失败：BattleController 句柄已失效");
+        if (ctx->bcHandle) ArkGcUnpin(ctx->bcHandle);
+        SetFeedback(FB_WARN, "调速已取消：当前战斗已结束或尚未开始");
         InterlockedExchange(&g_mainSpeedBusy, 0);
         return;
     }
@@ -1915,6 +2104,20 @@ static void ConsumeRequest()
     char matched[128] = { 0 };
     bool needRefreshSnap = true;
 
+    // 统一阶段守卫：非战斗进行中时拦截一切战斗修改请求，给出精确时机指引，杜绝脏写
+    const BattlePhase curPhase = (BattlePhase)InterlockedCompareExchange(&g_battlePhase, 0, 0);
+    if (kind != REQ_DUMP_CLASS && kind != REQ_SCAN_ROSTER && kind != REQ_RESET_SESSION && curPhase != PHASE_PLAYING)
+    {
+        if (curPhase == PHASE_LOBBY)
+            SetFeedback(FB_WARN, "操作已拦截：当前位于主界面/大厅，请先进入任意战斗关卡后再使用战斗定制功能");
+        else if (curPhase == PHASE_LOADING)
+            SetFeedback(FB_WARN, "操作已拦截：关卡正在初始化加载中，请等待进入战斗画面后再点");
+        else
+            SetFeedback(FB_WARN, "操作已拦截：本场战斗已进入结算阶段，禁止再写入状态（请等待进入下一关）");
+        InterlockedIncrement(&g_reqDone);
+        return;
+    }
+
     switch (kind)
     {
     case REQ_DUMP_CLASS:
@@ -1925,13 +2128,47 @@ static void ConsumeRequest()
         break;
 
     case REQ_SCAN_ROSTER:
+        PollBattleSessionGuard();
         RefreshBattleSnapshot();
-        SetFeedback(g_inBattle ? FB_OK : FB_WARN,
-                    g_inBattle ? "已刷新本局实时快照：带入干员 %d 名 | 场上存活怪物 %d 只 (%d 种)"
-                               : "当前未进入战斗关卡，无法扫描编队干员与怪物",
-                    g_stageCharCount, g_liveEnemyTotal, g_liveEnemyCount);
+        SetFeedback(g_battlePhase == PHASE_PLAYING ? FB_OK : FB_WARN,
+                    g_battlePhase == PHASE_PLAYING
+                        ? "已刷新本局实时快照：带入干员 %d 名 | 场上存活怪物 %d 只 (%d 种)"
+                        : "当前未处于战斗进行中（阶段=%ld），进入关卡后会自动加载编队与怪物",
+                    g_stageCharCount, g_liveEnemyTotal, g_liveEnemyCount, (long)g_battlePhase);
         needRefreshSnap = false;
         break;
+
+    case REQ_RESET_SESSION:
+    {
+        ResetPerBattleState(true);
+        if (curPhase == PHASE_PLAYING)
+        {
+            if (Il2CppObject *bc = GetBattleControllerFast())
+            {
+                if (InterlockedCompareExchange(&g_mainSpeedBusy, 1, 0) == 0)
+                {
+                    g_mainSpeedCtx.bcHandle   = ArkGcPin(bc);
+                    g_mainSpeedCtx.mode       = 0;
+                    g_mainSpeedCtx.speedLevel = 1; // 恢复 1x 标准速度
+                    g_mainSpeedCtx.timeScale  = 1.0f;
+                    if (ArkTaskPostMain(MainThreadBattleSpeedTask, &g_mainSpeedCtx, "battle.speed.reset"))
+                    {
+                        if (HWND hwnd = UiGameHwnd())
+                            PostMessageW(hwnd, WM_APP + 0x4D4F, 0, 0);
+                    }
+                    else
+                    {
+                        ArkGcUnpin(g_mainSpeedCtx.bcHandle);
+                        InterlockedExchange(&g_mainSpeedBusy, 0);
+                    }
+                }
+            }
+            RefreshBattleSnapshot();
+        }
+        SetFeedback(FB_OK, "已一键复位本局状态：关闭全部 4 项持续锁定 + 重置为全体干员 + 恢复标准速度 1x");
+        needRefreshSnap = false;
+        break;
+    }
 
     case REQ_MOD_CARD_COST:
     {
@@ -2247,18 +2484,18 @@ void Mod_OnReady()
 // Worker 线程，每 100ms 一次（已 attach 域）
 void Mod_OnTick()
 {
+    // ① 零 GC 停顿检测对战生命周期与脏状态（换关/重开/结算/代理指挥自动守卫）
+    PollBattleSessionGuard();
+
     ConsumeRequest();
     ArkTaskPump();
     ArkWatchApplyWrites();
 
-    // 零 GC 停顿探测战斗态：面板关闭且无锁定时 0 次 stop_gc_world，彻底零卡顿
-    const bool inBattleNow = (GetBattleControllerFast() != nullptr);
-    InterlockedExchange(&g_inBattle, inBattleNow ? 1 : 0);
-
+    const bool playingNow = (InterlockedCompareExchange(&g_battlePhase, 0, 0) == PHASE_PLAYING);
     ++g_tickCounter;
 
-    // 持续自动锁定：DP 每 100ms 零 GC 停顿维持；干员血量/技力/弹药每 200ms 维持
-    if (inBattleNow)
+    // ② 持续自动锁定：仅在真实战斗进行中 (PLAYING) 运行；结算或大厅自动暂停
+    if (playingNow)
     {
         if (InterlockedCompareExchange(&g_lockBattleDp, 0, 0) != 0)
             ApplyBattleDp(99);
@@ -2269,16 +2506,16 @@ void Mod_OnTick()
         }
     }
 
-    // 仅在面板展开时刷新本局编队/怪物快照（刚打开面板 100ms 内立刻刷一次，展开期间每 1.5s 刷一次；关闭面板零开销）
+    // ③ 仅在面板展开且处于战斗进行中时刷新本局编队/怪物快照（关闭面板 0 次 GC 停顿）
     static bool s_prevPanelVis = false;
     const bool panelVis = UiPanelVisible();
-    if (panelVis && (!s_prevPanelVis || (g_tickCounter % 15) == 0))
+    if (panelVis && playingNow && (!s_prevPanelVis || (g_tickCounter % 15) == 0))
     {
         RefreshBattleSnapshot();
     }
     s_prevPanelVis = panelVis;
 
-    // 每 500ms 刷新一次 Watch 缓存并落盘配置
+    // ④ 每 500ms 刷新一次 Watch 缓存并落盘配置
     if ((g_tickCounter % 5) == 0)
     {
         ArkWatchRefresh();
@@ -2403,34 +2640,110 @@ void Mod_DrawPanelTabs()
     SpinUnlock(&g_fbLock);
 
     // ========================================================================
-    // 顶部醒目即时反馈横幅（每次修改无论成功/提示/失败均有明确颜色与改前->改后反馈）
+    // 顶部对战状态守卫栏 + 醒目即时反馈横幅
     // ========================================================================
+    const BattlePhase curPhase = (BattlePhase)InterlockedCompareExchange(&g_battlePhase, 0, 0);
+    const bool isAutoReplay = (InterlockedCompareExchange(&g_isAutoReplay, 0, 0) != 0);
+    const LONG curSessId = InterlockedCompareExchange(&g_battleSessId, 0, 0);
+    const bool battleReady = (curPhase == PHASE_PLAYING);
+
     {
-        ImVec4 col = FeedbackColor(curFb.level);
-        ImVec4 bg  = ImVec4(col.x * 0.16f, col.y * 0.16f, col.z * 0.16f, 0.85f);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
-        ImGui::PushStyleColor(ImGuiCol_Border, col);
-        if (ImGui::BeginChild("##FeedbackBanner", ImVec2(0.0f, 36.0f), true, ImGuiWindowFlags_NoScrollbar))
+        ImVec4 stCol;
+        char stText[220];
+        if (curPhase == PHASE_PLAYING && isAutoReplay)
         {
-            ImGui::TextColored(col, "%s %s  %s",
-                               FeedbackPrefix(curFb.level),
-                               curFb.timeStr[0] ? curFb.timeStr : "--:--:--",
-                               curFb.msg);
-            ImGui::SameLine(ImGui::GetWindowWidth() - 190.0f);
-            ImGui::TextDisabled(g_inBattle ? "战斗中 | 请求 %ld/%ld" : "非战斗 | 请求 %ld/%ld",
-                                (long)g_reqDone, (long)g_reqSeq);
+            stCol = ImVec4(1.00f, 0.58f, 0.18f, 1.0f);
+            _snprintf_s(stText, sizeof(stText), _TRUNCATE,
+                        "⚠ 代理指挥录像中 [第 #%ld 局 · %s] — 已自动暂停持续锁定以防代理轴错乱翻车",
+                        (long)curSessId, g_curLevelId[0] ? g_curLevelId : "战斗关卡");
+        }
+        else if (curPhase == PHASE_PLAYING)
+        {
+            stCol = ImVec4(0.30f, 0.95f, 0.55f, 1.0f);
+            _snprintf_s(stText, sizeof(stText), _TRUNCATE,
+                        "● 战斗进行中 [第 #%ld 局 · %s] — 全部定制功能已解锁（切关/重开会自动防脏重置）",
+                        (long)curSessId, g_curLevelId[0] ? g_curLevelId : "战斗关卡");
+        }
+        else if (curPhase == PHASE_LOADING)
+        {
+            stCol = ImVec4(1.00f, 0.85f, 0.30f, 1.0f);
+            CopyStrSafe(stText, sizeof(stText), "○ 关卡初始化加载中... — 请稍候 (<1秒) 进入战斗画面后自动解锁");
+        }
+        else if (curPhase == PHASE_FINISHED)
+        {
+            stCol = ImVec4(0.95f, 0.72f, 0.32f, 1.0f);
+            CopyStrSafe(stText, sizeof(stText), "○ 本场战斗已结算 — 持续锁定已暂停、修改已锁定，进入下一关后自动重置");
+        }
+        else
+        {
+            stCol = ImVec4(0.55f, 0.80f, 1.00f, 1.0f);
+            CopyStrSafe(stText, sizeof(stText), "○ 当前位于主界面/大厅 — Mod 已注入就绪！进入任意战斗关卡后本页功能自动解锁");
+        }
+
+        ImVec4 stBg = ImVec4(stCol.x * 0.14f, stCol.y * 0.14f, stCol.z * 0.14f, 0.88f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, stBg);
+        ImGui::PushStyleColor(ImGuiCol_Border, stCol);
+        if (ImGui::BeginChild("##PhaseBanner", ImVec2(0.0f, 34.0f), true, ImGuiWindowFlags_NoScrollbar))
+        {
+            ImGui::TextColored(stCol, "%s", stText);
         }
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
     }
 
-    // 快捷刷新按钮 + 持续锁定汇总提示
-    if (ImGui::SmallButton("刷新本局编队与怪物快照"))
+    {
+        ImVec4 col = FeedbackColor(curFb.level);
+        ImVec4 bg  = ImVec4(col.x * 0.14f, col.y * 0.14f, col.z * 0.14f, 0.82f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+        ImGui::PushStyleColor(ImGuiCol_Border, col);
+        if (ImGui::BeginChild("##FeedbackBanner", ImVec2(0.0f, 34.0f), true, ImGuiWindowFlags_NoScrollbar))
+        {
+            ImGui::TextColored(col, "%s %s  %s",
+                               FeedbackPrefix(curFb.level),
+                               curFb.timeStr[0] ? curFb.timeStr : "--:--:--",
+                               curFb.msg);
+            ImGui::SameLine(ImGui::GetWindowWidth() - 150.0f);
+            ImGui::TextDisabled("请求 %ld/%ld", (long)g_reqDone, (long)g_reqSeq);
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+    }
+
+    // 快捷控制栏：刷新快照 + 一键复位本局 + 防脏状态自动重置开关
+    if (ImGui::SmallButton("刷新快照"))
         PostRequestEx(REQ_SCAN_ROSTER, "", 0, 0.0f);
     ImGui::SameLine();
-    ImGui::TextDisabled("提示：已屏蔽面板区域鼠标穿透，输入框原生支持中文输入法打字；推荐直接点选下方本局干员按钮");
+    if (ImGui::SmallButton("一键复位本局 (关全锁+1x速)"))
+        PostRequestEx(REQ_RESET_SESSION, "", 0, 0.0f);
+    ImGui::SameLine();
+    {
+        bool autoRst = (InterlockedCompareExchange(&g_autoResetNew, 0, 0) != 0);
+        if (ImGui::Checkbox("切关/重开/代理指挥自动重置锁定 (防脏状态)", &autoRst))
+        {
+            InterlockedExchange(&g_autoResetNew, autoRst ? 1 : 0);
+            SetFeedback(FB_INFO, autoRst
+                        ? "已开启防脏状态保护：切换关卡/重开/结算/代理指挥时将自动清空锁定与旧目标"
+                        : "已关闭切关自动清锁（仅代理指挥仍会保护；跨关刷图时锁定将保持生效）");
+        }
+    }
+
+    // 非战斗状态时展示清晰的「使用时机指引卡」，消除玩家的时机困惑
+    if (!battleReady)
+    {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.11f, 0.14f, 0.19f, 0.92f));
+        if (ImGui::BeginChild("##TimingGuide", ImVec2(0.0f, 68.0f), true, ImGuiWindowFlags_NoScrollbar))
+        {
+            ImGui::TextColored(ImVec4(0.65f, 0.90f, 1.0f, 1.0f), "何时可以使用 Mod？（防误操作保护已生效，下方战斗按钮已自动置灰）");
+            ImGui::TextDisabled("  1. 游戏启动后随时可按 [INSERT] 开关面板；主界面仅可使用「类浏览器 / 对象检查 / Dumper」等分析工具。");
+            ImGui::TextDisabled("  2. 进入任意关卡并出现战场画面后，本页立即解锁并自动列出本局编队干员；手牌0费/DP/倍速进关即改，攻速/攻击/弹药需干员上场后改。");
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+    }
+
     ImGui::Separator();
 
+    ImGui::BeginDisabled(!battleReady);
     if (ImGui::BeginTabBar("##BattleCustomSubTabs"))
     {
         // ============================================================
@@ -2886,6 +3199,7 @@ void Mod_DrawPanelTabs()
 
         ImGui::EndTabBar();
     }
+    ImGui::EndDisabled();
 
     // 底部可折叠「最近操作反馈记录」（保留最新 8 条带时间戳与状态色标）
     ImGui::Separator();
