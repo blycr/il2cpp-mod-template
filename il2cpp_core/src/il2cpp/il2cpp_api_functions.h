@@ -122,3 +122,23 @@ DO_API(const char*, il2cpp_type_get_name, (Il2CppType * type));
 // exception
 DO_API(void, il2cpp_format_exception, (Il2CppException * ex, char* message, int message_size));
 DO_API(void, il2cpp_format_stack_trace, (Il2CppException * ex, char* output, int output_size));
+
+// extended reflection & GC liveness (required by src/core/* and src/panels/*)
+DO_API(Il2CppClass*, il2cpp_class_get_declaring_type, (Il2CppClass * klass));
+DO_API(Il2CppClass*, il2cpp_class_get_element_class, (Il2CppClass * klass));
+DO_API(int, il2cpp_class_get_flags, (const Il2CppClass * klass));
+DO_API(int, il2cpp_class_get_rank, (const Il2CppClass * klass));
+DO_API(bool, il2cpp_class_is_assignable_from, (Il2CppClass * klass, Il2CppClass * oklass));
+DO_API(int, il2cpp_field_get_flags, (FieldInfo * field));
+DO_API(uint32_t, il2cpp_method_get_flags, (const MethodInfo * method, uint32_t * iflags));
+DO_API(Il2CppType*, il2cpp_method_get_param, (const MethodInfo * method, uint32_t index));
+DO_API(const char*, il2cpp_method_get_param_name, (const MethodInfo * method, uint32_t index));
+DO_API(bool, il2cpp_method_is_generic, (const MethodInfo * method));
+DO_API(void, il2cpp_stop_gc_world, ());
+DO_API(void, il2cpp_start_gc_world, ());
+DO_API(void*, il2cpp_unity_liveness_allocate_struct, (Il2CppClass * filter, int max_object_count, void(*register_objects_callback)(Il2CppObject** arr, int size, void* userdata), void* userdata, void*(*reallocate)(void* ptr, size_t size, void* userdata)));
+DO_API(void*, il2cpp_unity_liveness_calculation_begin, (Il2CppClass * filter, int max_object_count, void(*register_objects_callback)(Il2CppObject** arr, int size, void* userdata), void* userdata, void(*onWorldStarted)(), void(*onWorldStopped)()));
+DO_API(void, il2cpp_unity_liveness_calculation_from_statics, (void* state));
+DO_API(void, il2cpp_unity_liveness_calculation_end, (void* state));
+DO_API(void, il2cpp_unity_liveness_finalize, (void* state));
+DO_API(void, il2cpp_unity_liveness_free_struct, (void* state));

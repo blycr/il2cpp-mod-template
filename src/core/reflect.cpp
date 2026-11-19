@@ -88,6 +88,17 @@ static int BuildInto(Vec<ArkClassEntry> &dst)
             const char *name = api.il2cpp_class_get_name(k);
             if (!name || !name[0]) { ++errCount; continue; }
             const char *ns = api.il2cpp_class_get_namespace(k);
+            if ((!ns || !ns[0]) && api.il2cpp_class_get_declaring_type)
+            {
+                Il2CppClass *decl = api.il2cpp_class_get_declaring_type(k);
+                int dguard = 0;
+                while (decl && dguard++ < 6)
+                {
+                    const char *dns = api.il2cpp_class_get_namespace(decl);
+                    if (dns && dns[0]) { ns = dns; break; }
+                    decl = api.il2cpp_class_get_declaring_type(decl);
+                }
+            }
 
             ArkClassEntry *e = dst.Push();
             if (!e) break;
@@ -186,20 +197,28 @@ const ArkClassEntry *ArkReflectFindClass(const char *fullOrShort)
     const char *dot = strrchr(fullOrShort, '.');
     const char *shortName = dot ? dot + 1 : fullOrShort;
 
+    const ArkClassEntry *fallback = nullptr;
     for (int i = 0; i < g_index.count; ++i)
     {
         const ArkClassEntry *e = &g_index.data[i];
         if (strcmp(e->name, shortName) != 0) continue;
         if (!dot) return e;                       // 只给了短名，第一个匹配就算
-        if (strcmp(e->ns, "") != 0)
+        if (e->ns && e->ns[0])
         {
-            // 拼全名比较（ns + "." + name）
             char full[512];
             _snprintf_s(full, sizeof(full), _TRUNCATE, "%s.%s", e->ns, e->name);
             if (strcmp(full, fullOrShort) == 0) return e;
+            // 嵌套类（如 Torappu.Battle.Deck.CharacterCard）：ns 为 Torappu.Battle，name 为 CharacterCard
+            const size_t nslen = strlen(e->ns);
+            if (!fallback && strncmp(fullOrShort, e->ns, nslen) == 0 && fullOrShort[nslen] == '.')
+                fallback = e;
+        }
+        else if (!fallback)
+        {
+            fallback = e;
         }
     }
-    return nullptr;
+    return fallback;
 }
 
 // ================================================================ 字段
@@ -586,9 +605,60 @@ int ArkReflectReadFieldText(FieldInfo *f, Il2CppObject *instance, char *out, int
     }
     case VK_STRUCT:
     {
-        // 值类型（含 enum、以及游戏自己的 ObscuredFP 这种加密定点）：
-        // 不知道内部语义，就把原始字节打出来。至少能看出"它在变"。
         const int sz = ArkReflectSizeOf(t);
+        Il2CppClass *sk = api.il2cpp_class_from_type ? api.il2cpp_class_from_type(t) : nullptr;
+        const char *sn = (sk && api.il2cpp_class_get_name) ? api.il2cpp_class_get_name(sk) : "";
+        if (!sn) sn = "";
+
+        if (sk && api.il2cpp_class_is_enum && api.il2cpp_class_is_enum(sk))
+        {
+            long long ev = 0;
+            if (sz == 1)      ev = *(signed char *)addr;
+            else if (sz == 2) ev = *(short *)addr;
+            else if (sz == 8) ev = *(long long *)addr;
+            else              ev = *(int *)addr;
+            _snprintf_s(out, cap, _TRUNCATE, "%lld", ev);
+            return 0;
+        }
+        if (strcmp(sn, "FP") == 0 && sz == 8)
+        {
+            const double fv = (double)(*(long long *)addr) / 4294967296.0;
+            _snprintf_s(out, cap, _TRUNCATE, "%.4f", fv);
+            return 0;
+        }
+        if (strcmp(sn, "ObscuredFP") == 0 && sz >= 32)
+        {
+            const long long key = *(long long *)addr;
+            const long long hid = *((long long *)addr + 1);
+            const long long raw = key ? (hid ^ key) : hid;
+            _snprintf_s(out, cap, _TRUNCATE, "%.4f", (double)raw / 4294967296.0);
+            return 0;
+        }
+        if (strcmp(sn, "ObscuredInt") == 0 && sz >= 16)
+        {
+            const int key = *(int *)addr;
+            const int hid = *((int *)addr + 1);
+            _snprintf_s(out, cap, _TRUNCATE, "%d", key ? (hid ^ key) : hid);
+            return 0;
+        }
+        if (strcmp(sn, "ObscuredLong") == 0 && sz >= 32)
+        {
+            const long long key = *(long long *)addr;
+            const long long hid = *((long long *)addr + 1);
+            _snprintf_s(out, cap, _TRUNCATE, "%lld", key ? (hid ^ key) : hid);
+            return 0;
+        }
+        if (strcmp(sn, "ObscuredFloat") == 0 && sz >= 20)
+        {
+            const int key = *(int *)addr;
+            const int hid = *((int *)addr + 1);
+            const int bits = key ? (hid ^ key) : hid;
+            float fv = 0.0f;
+            memcpy(&fv, &bits, sizeof(float));
+            _snprintf_s(out, cap, _TRUNCATE, "%.4f", (double)fv);
+            return 0;
+        }
+
         char hex[160] = { 0 };
         int pos = 0;
         const int show = (sz > 16) ? 16 : sz;
@@ -655,6 +725,62 @@ bool ArkReflectWriteFieldNum(FieldInfo *f, Il2CppObject *instance, double v)
     case VK_DOUBLE:
         *(double *)addr = v;
         return true;
+    case VK_STRUCT:
+    {
+        const int sz = ArkReflectSizeOf(t);
+        Il2CppClass *sk = api.il2cpp_class_from_type ? api.il2cpp_class_from_type(t) : nullptr;
+        const char *sn = (sk && api.il2cpp_class_get_name) ? api.il2cpp_class_get_name(sk) : "";
+        if (!sn) sn = "";
+
+        if (sk && api.il2cpp_class_is_enum && api.il2cpp_class_is_enum(sk))
+        {
+            if (sz == 1)      *(signed char *)addr = (signed char)(long long)v;
+            else if (sz == 2) *(short *)addr       = (short)(long long)v;
+            else if (sz == 8) *(long long *)addr   = (long long)v;
+            else              *(int *)addr         = (int)(long long)v;
+            return true;
+        }
+        if (strcmp(sn, "FP") == 0 && sz == 8)
+        {
+            *(long long *)addr = (long long)(v * 4294967296.0);
+            return true;
+        }
+        if (strcmp(sn, "ObscuredFP") == 0 && sz >= 32)
+        {
+            const long long raw = (long long)(v * 4294967296.0);
+            const long long key = *(long long *)addr;
+            *((long long *)addr + 1) = raw ^ key;
+            *((long long *)addr + 3) = raw;
+            return true;
+        }
+        if (strcmp(sn, "ObscuredInt") == 0 && sz >= 16)
+        {
+            const int nv = (int)(long long)v;
+            const int key = *(int *)addr;
+            *((int *)addr + 1) = nv ^ key;
+            *((int *)addr + 3) = nv;
+            return true;
+        }
+        if (strcmp(sn, "ObscuredLong") == 0 && sz >= 32)
+        {
+            const long long nv = (long long)v;
+            const long long key = *(long long *)addr;
+            *((long long *)addr + 1) = nv ^ key;
+            *((long long *)addr + 3) = nv;
+            return true;
+        }
+        if (strcmp(sn, "ObscuredFloat") == 0 && sz >= 20)
+        {
+            const float fv = (float)v;
+            int bits = 0;
+            memcpy(&bits, &fv, sizeof(float));
+            const int key = *(int *)addr;
+            *((int *)addr + 1) = bits ^ key;
+            *(float *)((char *)addr + 16) = fv;
+            return true;
+        }
+        return false;
+    }
     default:
         // 值类型/引用类型不在这里直接写 —— 需要知道内部布局，走专门模块。
         return false;

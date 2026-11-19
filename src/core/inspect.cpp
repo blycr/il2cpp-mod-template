@@ -187,8 +187,76 @@ static bool WantsToString(Il2CppClass *k)
     if (!k) return false;
     Il2CppApi &api = ir::Api();
     const char *nm = api.il2cpp_class_get_name ? api.il2cpp_class_get_name(k) : nullptr;
-    if (nm && strstr(nm, "Obscured")) return true;
+    if (nm && (strstr(nm, "Obscured") || strcmp(nm, "FP") == 0)) return true;
     return api.il2cpp_class_is_enum && api.il2cpp_class_is_enum(k);
+}
+
+// 纯 C++ 直接解算明日方舟 FP / ObscuredFP / ObscuredInt / ObscuredLong / ObscuredFloat / Enum（零托管调用，且可直接改值）
+static bool DecodeSpecialStruct(Il2CppClass *sk, void *addr, int sz, char *out, int cap, double *outNum)
+{
+    if (!sk || !addr || !out || cap <= 0) return false;
+    Il2CppApi &api = ir::Api();
+    const char *sn = api.il2cpp_class_get_name ? api.il2cpp_class_get_name(sk) : "";
+    if (!sn) sn = "";
+
+    if (api.il2cpp_class_is_enum && api.il2cpp_class_is_enum(sk))
+    {
+        long long ev = 0;
+        if (sz == 1)      ev = *(signed char *)addr;
+        else if (sz == 2) ev = *(short *)addr;
+        else if (sz == 8) ev = *(long long *)addr;
+        else              ev = *(int *)addr;
+        _snprintf_s(out, cap, _TRUNCATE, "%lld", ev);
+        if (outNum) *outNum = (double)ev;
+        return true;
+    }
+    if (strcmp(sn, "FP") == 0 && sz == 8)
+    {
+        const double fv = (double)(*(long long *)addr) / 4294967296.0;
+        _snprintf_s(out, cap, _TRUNCATE, "%.4f", fv);
+        if (outNum) *outNum = fv;
+        return true;
+    }
+    if (strcmp(sn, "ObscuredFP") == 0 && sz >= 32)
+    {
+        const long long key = *(long long *)addr;
+        const long long hid = *((long long *)addr + 1);
+        const long long raw = key ? (hid ^ key) : hid;
+        const double fv = (double)raw / 4294967296.0;
+        _snprintf_s(out, cap, _TRUNCATE, "%.4f", fv);
+        if (outNum) *outNum = fv;
+        return true;
+    }
+    if (strcmp(sn, "ObscuredInt") == 0 && sz >= 16)
+    {
+        const int key = *(int *)addr;
+        const int hid = *((int *)addr + 1);
+        const int real = key ? (hid ^ key) : hid;
+        _snprintf_s(out, cap, _TRUNCATE, "%d", real);
+        if (outNum) *outNum = (double)real;
+        return true;
+    }
+    if (strcmp(sn, "ObscuredLong") == 0 && sz >= 32)
+    {
+        const long long key = *(long long *)addr;
+        const long long hid = *((long long *)addr + 1);
+        const long long real = key ? (hid ^ key) : hid;
+        _snprintf_s(out, cap, _TRUNCATE, "%lld", real);
+        if (outNum) *outNum = (double)real;
+        return true;
+    }
+    if (strcmp(sn, "ObscuredFloat") == 0 && sz >= 20)
+    {
+        const int key = *(int *)addr;
+        const int hid = *((int *)addr + 1);
+        const int bits = key ? (hid ^ key) : hid;
+        float fv = 0.0f;
+        memcpy(&fv, &bits, sizeof(float));
+        _snprintf_s(out, cap, _TRUNCATE, "%.4f", (double)fv);
+        if (outNum) *outNum = (double)fv;
+        return true;
+    }
+    return false;
 }
 
 static bool BoxAndToString(Il2CppClass *k, void *addr, char *out, int cap)
@@ -388,6 +456,12 @@ static void ReadFieldValue(FieldInfo *f, Il2CppObject *owner, ArkInspNode *n)
     case VK_STRUCT:
     {
         Il2CppClass *sk = api.il2cpp_class_from_type ? api.il2cpp_class_from_type(t) : nullptr;
+        const int sz = ArkReflectSizeOf(t);
+        if (DecodeSpecialStruct(sk, addr, sz, n->value, sizeof(n->value), &n->num))
+        {
+            n->editable = 1;
+            return;
+        }
         char cls[120];
         ClassFullName(sk, cls, sizeof(cls));
 
@@ -397,7 +471,6 @@ static void ReadFieldValue(FieldInfo *f, Il2CppObject *owner, ArkInspNode *n)
         if ((obscured || isEnum) && BoxAndToString(sk, addr, n->value, sizeof(n->value)))
             return;
 
-        const int sz = ArkReflectSizeOf(t);
         char hex[120] = { 0 };
         int pos = 0;
         const int show = (sz > 12) ? 12 : sz;
@@ -904,8 +977,12 @@ static void WalkStructFieldsAt(void *base, Il2CppClass *k, int depth, int valueS
             {
                 const bool drillable = fcls && nest > 1 && ClassHasFields(fcls) && (depth + 1 <= g_maxDepth);
 
-                if (!drillable && fcls && WantsToString(fcls) &&
-                    BoxAndToString(fcls, addr, n->value, sizeof(n->value)))
+                if (DecodeSpecialStruct(fcls, addr, fsz, n->value, sizeof(n->value), &n->num))
+                {
+                    // 已由纯 C++ 解出 FP / Obscured* / Enum
+                }
+                else if (fcls && WantsToString(fcls) &&
+                         BoxAndToString(fcls, addr, n->value, sizeof(n->value)))
                 {
                     // 枚举 / 加密数值：托管侧已经解出可读形式
                 }
@@ -1044,8 +1121,9 @@ static void WalkArrayItems(Il2CppObject *arr, int elemDepth, int limit)
         else
         {
             char tmp[160];
-            // ★ 只有加密数值 / 枚举才值得绕托管侧；别的值类型直读字节。
-            if (WantsToString(ek) && BoxAndToString(ek, slot, tmp, sizeof(tmp)))
+            if (DecodeSpecialStruct(ek, slot, elemSize, tmp, sizeof(tmp), &n->num))
+                _snprintf_s(n->value, sizeof(n->value), _TRUNCATE, "%s", tmp);
+            else if (WantsToString(ek) && BoxAndToString(ek, slot, tmp, sizeof(tmp)))
                 _snprintf_s(n->value, sizeof(n->value), _TRUNCATE, "%s", tmp);
             else
             {

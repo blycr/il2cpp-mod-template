@@ -9,7 +9,7 @@ param([switch]$Clean)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-$MINGW  = if ($env:MINGW) { $env:MINGW } else { "D:/mingw64" }
+$MINGW  = if ($env:MINGW) { $env:MINGW } elseif (Test-Path "D:/mingw64") { "D:/mingw64" } else { "C:/msys64/mingw64" }
 $CXX    = "$MINGW/bin/x86_64-w64-mingw32-g++.exe"
 $CC     = "$MINGW/bin/x86_64-w64-mingw32-gcc.exe"
 $IL2CPP = "il2cpp_core"
@@ -57,6 +57,22 @@ $units = [ordered]@{
     "log_panel"             = @{ src = "src/ui/log_panel.cpp";                        cc = $CXX; fl = $CXXFLAGS }
     "log_buffer"            = @{ src = "src/log_buffer.cpp";                          cc = $CXX; fl = $CXXFLAGS }
     "hot_reload"            = @{ src = "src/hot_reload.cpp";                          cc = $CXX; fl = $CXXFLAGS }
+    "core_config"           = @{ src = "src/core/config.cpp";                         cc = $CXX; fl = $CXXFLAGS }
+    "core_dumper"           = @{ src = "src/core/dumper.cpp";                         cc = $CXX; fl = $CXXFLAGS }
+    "core_gcobj"            = @{ src = "src/core/gcobj.cpp";                          cc = $CXX; fl = $CXXFLAGS }
+    "core_guard"            = @{ src = "src/core/guard.cpp";                          cc = $CXX; fl = $CXXFLAGS }
+    "core_hotkey"           = @{ src = "src/core/hotkey.cpp";                         cc = $CXX; fl = $CXXFLAGS }
+    "core_inspect"          = @{ src = "src/core/inspect.cpp";                        cc = $CXX; fl = $CXXFLAGS }
+    "core_invoke"           = @{ src = "src/core/invoke.cpp";                         cc = $CXX; fl = $CXXFLAGS }
+    "core_paths"            = @{ src = "src/core/paths.cpp";                          cc = $CXX; fl = $CXXFLAGS }
+    "core_reflect"          = @{ src = "src/core/reflect.cpp";                        cc = $CXX; fl = $CXXFLAGS }
+    "core_taskbus"          = @{ src = "src/core/taskbus.cpp";                        cc = $CXX; fl = $CXXFLAGS }
+    "panel_classbrowser"    = @{ src = "src/panels/classbrowser.cpp";                 cc = $CXX; fl = $CXXFLAGS }
+    "panel_dumper"          = @{ src = "src/panels/dumper.cpp";                       cc = $CXX; fl = $CXXFLAGS }
+    "panel_hotkeys"         = @{ src = "src/panels/hotkeys.cpp";                      cc = $CXX; fl = $CXXFLAGS }
+    "panel_invoke"          = @{ src = "src/panels/invoke.cpp";                       cc = $CXX; fl = $CXXFLAGS }
+    "panel_objects"         = @{ src = "src/panels/objects.cpp";                      cc = $CXX; fl = $CXXFLAGS }
+    "panel_watch"           = @{ src = "src/panels/watch.cpp";                        cc = $CXX; fl = $CXXFLAGS }
     "imgui"                 = @{ src = "$IMGUI/imgui.cpp";                            cc = $CXX; fl = $CXXFLAGS }
     "imgui_draw"            = @{ src = "$IMGUI/imgui_draw.cpp";                       cc = $CXX; fl = $CXXFLAGS }
     "imgui_widgets"         = @{ src = "$IMGUI/imgui_widgets.cpp";                    cc = $CXX; fl = $CXXFLAGS }
@@ -131,17 +147,22 @@ foreach ($name in $units.Keys) {
         continue
     }
     Write-Host "  CC    $name" -ForegroundColor Cyan
-    # 2>&1 |Out-String：mingw 把 warning 也写 stderr，直接重定向会被
-    # $ErrorActionPreference="Stop" 当成 NativeCommandError 抛出来，
-    # 编译明明成功却被判失败。先 Out-String 归一成普通字符串再打印。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & $u.cc @($u.fl) @INC -c $u.src -o $obj 2>&1 | Out-String | Write-Host
-    if ($LASTEXITCODE -ne 0) { Write-Host "[x] 编译失败: $name" -ForegroundColor Red; $failed = $true; break }
+    $rc = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    if ($rc -ne 0) { Write-Host "[x] 编译失败: $name" -ForegroundColor Red; $failed = $true; break }
 }
 if ($failed) { exit 1 }
 
 Write-Host "  LINK  $TARGET" -ForegroundColor Magenta
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 & $CXX -shared -o $TARGET @objs -static '-Wl,--gc-sections' '-Wl,--exclude-all-symbols' '-Wl,--subsystem,windows' mod_template.def @LIBS
-if ($LASTEXITCODE -ne 0) { Write-Host "[x] 链接失败" -ForegroundColor Red; exit 1 }
+$rc = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+if ($rc -ne 0) { Write-Host "[x] 链接失败" -ForegroundColor Red; exit 1 }
 
 $sz = (Get-Item $TARGET).Length
 Write-Host ""

@@ -115,6 +115,13 @@ static const wchar_t *PickLogDir(wchar_t *out, int cap)
     }
     if (GetEnvironmentVariableW(MOD_DIR_ENV, out, cap) > 0)
         return out;
+    if (GetEnvironmentVariableW(L"IL2CPP_TEST_DIR", out, cap) > 0)
+        return out;
+    if (GetFileAttributesW(MOD_FIXED_RUNTIME_DIR) != INVALID_FILE_ATTRIBUTES)
+    {
+        wcscpy_s(out, cap, MOD_FIXED_RUNTIME_DIR);
+        return out;
+    }
     if (GetCurrentDirectoryW(cap, out) > 0)
         return out;
     GetTempPathW(cap, out);
@@ -402,7 +409,7 @@ static void PanelDraw()
             PanelDrawStatus();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("工具"))
+        if (MOD_TOOL_DLL[0] && ImGui::BeginTabItem("工具"))
         {
             ToolDrawInPanel();
             ImGui::EndTabItem();
@@ -545,7 +552,7 @@ static DWORD WINAPI Worker(LPVOID)
     }
     else
     {
-        Log("TARGET hook skipped (no class/method in mod.ini)");
+        Log("TARGET hook: none configured in mod.ini (interactive panels active)");
     }
 
     // ---- 可选：按配置 dump 一个类（排查字段偏移用）----
@@ -564,10 +571,10 @@ static DWORD WINAPI Worker(LPVOID)
     for (;;)
     {
         if (g_workerStop) { Log("[hot] 主循环收到停止标志，退出"); return 0; }
-        Sleep(1000);
+        Sleep(100);
         Mod_OnTick();
-        if (++tick % 10 == 0)
-            Log("heartbeat: %us class_from_name=%ld string_new=%ld target=%ld", tick,
+        if (++tick % 100 == 0)
+            Log("heartbeat: %us class_from_name=%ld string_new=%ld target=%ld", tick / 10,
                 (long)g_canaryFromName, (long)g_canaryStringNew, (long)g_targetHits);
     }
 }

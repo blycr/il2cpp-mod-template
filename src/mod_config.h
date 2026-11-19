@@ -51,12 +51,16 @@
 
 // ---------------------------------------------------------------- 5. 工具 DLL（可选）
 // 双 DLL 架构：本 DLL 手动映射（零 .tls、无 STL），分析工具走普通 LoadLibrary，
-// 由系统加载器管理 TLS/CRT，可以自由用 STL/异常。没有工具 DLL 就留空字符串。
-#define MOD_TOOL_DLL         L"il2cpp_tool.dll"
+// 由系统加载器管理 TLS/CRT，可以自由用 STL/异常。
+// 当前已将 6 大分析面板 (src/core + src/panels) 直接内联编译进 il2cpp_mod.dll，故此处置空。
+#define MOD_TOOL_DLL         L""
 
 // ---------------------------------------------------------------- 6. 目录覆盖
 // 注入时可用该环境变量显式指定「模块目录」，覆盖自动探测。
 #define MOD_DIR_ENV          L"IL2CPP_MOD_DIR"
+#ifndef MOD_FIXED_RUNTIME_DIR
+#define MOD_FIXED_RUNTIME_DIR L""
+#endif
 
 // ---------------------------------------------------------------- 7. 行为开关
 // 反射自测：引导完成后自动枚举程序集并打印（关掉可省掉一次全量遍历）。
@@ -83,3 +87,11 @@
 #ifndef MOD_FONT_FULL_CJK
 #define MOD_FONT_FULL_CJK    1
 #endif
+
+// ---------------------------------------------------------------- 9. 内置运行时分析工具箱 (src/core + src/panels)
+#define MOD_CLASS_INDEX_MAX  80000                 // 全程序集类索引上限（明日方舟约 5 万+ 类）
+#define MOD_WATCH_MAX        64                    // Watch 面板最大监视槽数
+#define MOD_TASKBUS_CAP      256                   // 普通任务队列容量（必须为 2 的幂）
+#define MOD_MAINQ_CAP        128                   // Unity 主线程专用队列容量（必须为 2 的幂）
+#define MOD_TOOLS_INI        L"il2cpp_tools.ini"   // 声明式配置落盘文件
+#define MOD_CRASH_LOG        L"il2cpp_crash.log"   // VEH 崩溃取证日志文件

@@ -26,7 +26,7 @@ struct Il2CppApi
 //  做法：这里记录成员总数；il2cpp_api.cpp（唯一填充 g_api 的 TU）在编译期
 //  用另一个常量交叉验证。改列表而漏编时，两处数字不一致 -> 编译直接失败。
 // ============================================================================
-#define IL2CPP_API_MEMBER_COUNT_2026_10_10  83   // <-- 增删 DO_API 后同步改这里
+#define IL2CPP_API_MEMBER_COUNT_2026_10_10  101  // <-- 增删 DO_API 后同步改这里 (83 + 18 toolbox APIs)
 // 2026-10-12: +1 = il2cpp_class_get_methods（枚举类方法，用于挑出非泛型重载）
 // sizeof(Il2CppApi) = 成员数 * sizeof(函数指针)，x64 上函数指针恒为 8 字节。
 // 放在结构体定义**之后**，任何 TU 只要编进来就会带上这个常量。

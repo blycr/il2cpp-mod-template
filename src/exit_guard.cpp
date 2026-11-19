@@ -5,11 +5,13 @@
 //   · 不碰游戏的对象状态（除了 SetWindowLongPtr 换窗口过程这一处写操作）
 // ============================================================================
 #include "exit_guard.h"
+#include "ui/ui_api.h"
 
 #include <windows.h>
 
 // main.cpp 的日志内核（双写 文件 + 面板环形缓冲）
 extern void LogRaw(const char *fmt, ...);
+extern void Mod_OnGameThread();
 
 namespace
 {
@@ -24,6 +26,33 @@ HWND    g_hwnd      = nullptr;
 WNDPROC g_origProc  = nullptr;    // 游戏自己的窗口过程（我们要转发给它）
 HANDLE  g_watch     = nullptr;
 DWORD   g_watchTid  = 0;
+
+// 动态加载 imm32.dll 的 ImmAssociateContextEx（零静态导入表污染），
+// 解决 Unity 主动禁用主窗口 IME 导致中文输入法弹不出来的问题。
+typedef BOOL (WINAPI *ImmAssociateContextExFn)(HWND, HANDLE, DWORD);
+static ImmAssociateContextExFn g_pImmAssocEx = nullptr;
+static bool g_immResolved = false;
+static bool g_imeEnabledByUs = false;
+
+static void EnsureImeForTextInput(HWND hwnd, bool wantText)
+{
+    if (!hwnd || wantText == g_imeEnabledByUs) return;
+    if (!g_immResolved)
+    {
+        g_immResolved = true;
+        HMODULE hImm = GetModuleHandleW(L"imm32.dll");
+        if (!hImm) hImm = LoadLibraryW(L"imm32.dll");
+        if (hImm)
+            g_pImmAssocEx = (ImmAssociateContextExFn)GetProcAddress(hImm, "ImmAssociateContextEx");
+    }
+    if (g_pImmAssocEx)
+    {
+        // 0x0010 = IACE_DEFAULT（启用默认中文输入法上下文）
+        if (wantText)
+            g_pImmAssocEx(hwnd, nullptr, 0x0010);
+    }
+    g_imeEnabledByUs = wantText;
+}
 
 // 清理线程体：跑真正的清理（内部会有若干秒等待，所以绝不能放在游戏消息线程上）
 DWORD WINAPI CleanupThread(LPVOID)
@@ -55,7 +84,10 @@ void Trigger(const char *why)
     (void)th;
 }
 
-// 替换后的窗口过程。**任何分支都必须转发给原过程**，否则游戏自己的窗口逻辑坏掉。
+// 替换后的窗口过程：
+//   1) 捕获退出信号与 Mod 主线程任务消息 (WM_APP + 0x4D4F)
+//   2) 当 ImGui 面板可见且悬停/弹出时拦截鼠标消息与 RawInput 鼠标包，彻底杜绝鼠标穿透到游戏
+//   3) 当 ImGui 输入框获取焦点时启用 IME 并将 WM_CHAR (含中文) 推送给 ImGui，同时阻止按键穿透到游戏
 LRESULT CALLBACK ExitWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
@@ -65,8 +97,97 @@ LRESULT CALLBACK ExitWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_QUERYENDSESSION:  Trigger("WM_QUERYENDSESSION");  break;  // 注销/关机
     case WM_ENDSESSION:       Trigger("WM_ENDSESSION");       break;
     case WM_NCDESTROY:        Trigger("WM_NCDESTROY");        break;  // 窗口彻底销毁（最后一道）
+    case WM_APP + 0x4D4F:
+        if (!g_fired)
+        {
+            EnsureImeForTextInput(hwnd, UiWantTextInput());
+            Mod_OnGameThread();
+        }
+        return 0;
     default: break;
     }
+
+    if (!g_fired && UiPanelVisible())
+    {
+        const bool wantText = UiWantTextInput();
+        EnsureImeForTextInput(hwnd, wantText);
+
+        // ---- 1) 拦截穿透到游戏的鼠标点击 / 滚轮 / RawInput ----
+        if (UiWantCaptureMouse())
+        {
+            switch (msg)
+            {
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_LBUTTONDBLCLK:
+            case WM_RBUTTONDOWN:
+            case WM_RBUTTONUP:
+            case WM_RBUTTONDBLCLK:
+            case WM_MBUTTONDOWN:
+            case WM_MBUTTONUP:
+            case WM_MBUTTONDBLCLK:
+            case WM_XBUTTONDOWN:
+            case WM_XBUTTONUP:
+            case WM_XBUTTONDBLCLK:
+            case WM_MOUSEWHEEL:
+            case WM_MOUSEHWHEEL:
+                return 0;
+            case WM_INPUT:
+            {
+                RAWINPUTHEADER hdr = {};
+                UINT sz = sizeof(hdr);
+                if (GetRawInputData((HRAWINPUT)lp, RID_HEADER, &hdr, &sz, sizeof(hdr)) != (UINT)-1)
+                {
+                    if (hdr.dwType == RIM_TYPEMOUSE)
+                        return 0;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+
+        // ---- 2) 原生中文 IME 与文本输入路由（输入框聚焦时阻止按键穿透到游戏）----
+        if (wantText)
+        {
+            switch (msg)
+            {
+            case WM_CHAR:
+                if (wp >= 0x20)
+                    UiPushInputChar((unsigned short)wp);
+                return 0;
+            case WM_IME_SETCONTEXT:
+            case WM_IME_STARTCOMPOSITION:
+            case WM_IME_COMPOSITION:
+            case WM_IME_ENDCOMPOSITION:
+            case WM_IME_NOTIFY:
+                // 绕过 Unity 的 IME 抑制逻辑，直接交给系统 DefWindowProcW 弹出候选框并产生 WM_CHAR
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            case WM_KEYDOWN:
+            case WM_KEYUP:
+            case WM_SYSKEYDOWN:
+            case WM_SYSKEYUP:
+                if (wp != VK_INSERT)
+                    return 0;
+                break;
+            case WM_INPUT:
+            {
+                RAWINPUTHEADER hdr = {};
+                UINT sz = sizeof(hdr);
+                if (GetRawInputData((HRAWINPUT)lp, RID_HEADER, &hdr, &sz, sizeof(hdr)) != (UINT)-1)
+                {
+                    if (hdr.dwType == RIM_TYPEKEYBOARD)
+                        return 0;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+    }
+
     if (g_origProc)
         return CallWindowProcW(g_origProc, hwnd, msg, wp, lp);
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -126,7 +247,8 @@ void ExitGuard_AttachToWindow(HWND hwnd)
     else
     {
         g_origProc = (WNDPROC)prev;
-        LogRaw("[exit] 已子类化游戏窗口过程 %p -> %p（捕获 WM_CLOSE/WM_DESTROY）",
+        UiSetWndProcAttached(true);
+        LogRaw("[exit] 已子类化游戏窗口过程 %p -> %p（已启用退出守护 + 防鼠标穿透 + 原生中文IME）",
                (void *)prev, (void *)&ExitWndProc);
     }
 
@@ -158,6 +280,7 @@ void ExitGuard_Detach(void)
         LONG_PTR prev = SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_origProc);
         if (prev || GetLastError() == 0)
         {
+            UiSetWndProcAttached(false);
             LogRaw("[exit] 已还原游戏窗口过程");
             g_origProc = nullptr;
         }

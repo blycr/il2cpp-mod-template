@@ -92,7 +92,7 @@ static IDXGISwapChain *g_uiSc = nullptr;     // 当前绑定（游戏自己的�
 static void *g_patchedPresentAddr = nullptr;
 static void **g_presentVtable = nullptr;   // 被改的那张 vtable（存活校验用它）
 static void **g_resizeVtable = nullptr;    // ResizeBuffers 被改的那张 vtable（卸载时还原）
-static bool  g_shutdownDone = false;      // 卸载幂等标记
+static volatile LONG g_shutdownDone = 0;     // 卸载幂等标记（LONG 对齐，避免 InterlockedExchange 越界写 1 字节 bool）
 
 // ---- 跨线程卸载请求 --------------------------------------------------------
 //
@@ -126,6 +126,45 @@ static ULONGLONG g_lastFrameTime = 0;   // 算 DeltaTime 用（win32 backend 被
 static bool  g_cursorOverPanel = false;
 // 面板矩形（屏幕坐标），供光标命中测试与"吃掉点击"使用
 static float g_panelScreenX0 = 0, g_panelScreenY0 = 0, g_panelScreenX1 = 0, g_panelScreenY1 = 0;
+
+// ---- 防鼠标穿透 + 原生中文 IME 输入支持（跨线程原子状态，零 STL/TLS）----
+static volatile LONG g_wantCaptureMouse     = 0;
+static volatile LONG g_hasActivePopupOrDrag = 0;
+static volatile LONG g_wantTextInput        = 0;
+static volatile LONG g_wndProcAttached      = 0;
+static volatile LONG g_llMouseDown[3]       = { 0, 0, 0 }; // 0=L 1=R 2=M（吞掉点击后仍喂给 ImGui）
+static volatile LONG g_llSwallowed[3]       = { 0, 0, 0 }; // 成对吞掉对应的 UP，防止按键卡死
+
+enum { UI_CHAR_RING_CAP = 128 };
+static volatile unsigned short g_charRing[UI_CHAR_RING_CAP] = {};
+static volatile LONG g_charHead = 0;
+static volatile LONG g_charTail = 0;
+
+void UiPushInputChar(unsigned short utf16Char)
+{
+    if (utf16Char < 0x20) return;
+    LONG head = g_charHead;
+    LONG next = (head + 1) & (UI_CHAR_RING_CAP - 1);
+    if (next == g_charTail) return; // 满则丢弃
+    g_charRing[head] = utf16Char;
+    MemoryBarrier();
+    g_charHead = next;
+}
+
+void UiSetWndProcAttached(bool attached)
+{
+    InterlockedExchange(&g_wndProcAttached, attached ? 1 : 0);
+}
+
+bool UiWantCaptureMouse()
+{
+    return g_panelVisible && (InterlockedCompareExchange(&g_wantCaptureMouse, 0, 0) != 0);
+}
+
+bool UiWantTextInput()
+{
+    return g_panelVisible && (InterlockedCompareExchange(&g_wantTextInput, 0, 0) != 0);
+}
 
 static HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain *, UINT, UINT);
 // 卸载时序驱动：在 HookPresent 开头调用（必须早于任何 imgui 操作）
@@ -548,13 +587,21 @@ static void UpdateCursorVisibility()
     if (!g_uiReady) return;
     ImGuiIO &io = ImGui::GetIO();
 
-    // 面板矩形由主程序（il2cpp_test.cpp）每帧用 ImGui::GetWindowPos()+GetWindowSize()
-    // 主动上报 —— 不用 FindWindowByName，它在 imgui 内部命名空间里，跨文件用不稳。
+    if (!g_panelVisible) {
+        g_cursorOverPanel = false;
+        InterlockedExchange(&g_wantCaptureMouse, 0);
+        InterlockedExchange(&g_hasActivePopupOrDrag, 0);
+        InterlockedExchange(&g_wantTextInput, 0);
+        io.MouseDrawCursor = false;
+        return;
+    }
+
     if (!g_panelRectValid)
         return;
 
-    // 屏幕坐标 = imgui 坐标 + 客户区屏幕原点（与 PollMouseForImGui 反向）
+    // 屏幕坐标 = imgui 坐标 * (client / DisplaySize) + 客户区屏幕原点（与 PollMouseForImGui 精确反向）
     float sx = 0, sy = 0;
+    float scaleX = 1.0f, scaleY = 1.0f;
     if (g_gameHwnd && IsWindow(g_gameHwnd)) {
         RECT rc;
         if (GetClientRect(g_gameHwnd, &rc) && rc.right > rc.left && rc.bottom > rc.top) {
@@ -562,16 +609,30 @@ static void UpdateCursorVisibility()
             ClientToScreen(g_gameHwnd, &org);
             sx = (float)org.x;
             sy = (float)org.y;
+            const int cw = rc.right - rc.left;
+            const int ch = rc.bottom - rc.top;
+            if (io.DisplaySize.x > 0.0f) scaleX = (float)cw / io.DisplaySize.x;
+            if (io.DisplaySize.y > 0.0f) scaleY = (float)ch / io.DisplaySize.y;
         }
     }
-    // 面板的屏幕矩形（命中测试用）
-    g_panelScreenX0 = g_panelX0 + sx; g_panelScreenY0 = g_panelY0 + sy;
-    g_panelScreenX1 = g_panelX1 + sx; g_panelScreenY1 = g_panelY1 + sy;
+    // 面板的屏幕矩形（命中测试与防点击透传共用）
+    g_panelScreenX0 = g_panelX0 * scaleX + sx;
+    g_panelScreenY0 = g_panelY0 * scaleY + sy;
+    g_panelScreenX1 = g_panelX1 * scaleX + sx;
+    g_panelScreenY1 = g_panelY1 * scaleY + sy;
 
-    float screenX = io.MousePos.x + sx;
-    float screenY = io.MousePos.y + sy;
+    float screenX = io.MousePos.x * scaleX + sx;
+    float screenY = io.MousePos.y * scaleY + sy;
 
     const bool over = CursorOverPanel(screenX, screenY);
+    const bool popupOrDrag = ImGui::IsAnyItemActive() ||
+                             ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId);
+    const bool captureMouse = over || io.WantCaptureMouse || popupOrDrag;
+
+    InterlockedExchange(&g_wantCaptureMouse, captureMouse ? 1 : 0);
+    InterlockedExchange(&g_hasActivePopupOrDrag, popupOrDrag ? 1 : 0);
+    InterlockedExchange(&g_wantTextInput, io.WantTextInput ? 1 : 0);
+
     if (over != g_cursorOverPanel) {
         g_cursorOverPanel = over;
         if (g_frame <= 3 || g_frame % 600 == 0)
@@ -580,11 +641,8 @@ static void UpdateCursorVisibility()
                   screenX, screenY, g_panelScreenX0, g_panelScreenY0, g_panelScreenX1, g_panelScreenY1,
                   (int)g_panelRectValid);
     }
-    // 用 imgui 内置的软件光标，但**只在悬停面板时打开**：
-    //   - 游戏（Unity）自己用贴图画光标，那个光标在 overlay 之下会被面板盖住；
-    //   - 悬停面板时用 imgui 的光标（画在最上层，永远可见）；
-    //   - 移出面板就关掉，让游戏自己的光标回到正常状态，不干扰操作。
-    io.MouseDrawCursor = over;
+    // 悬停面板或弹窗/拖拽期间显示 ImGui 软件光标，移出面板自动还给游戏原生光标
+    io.MouseDrawCursor = captureMouse;
 }
 
 void UiSetHooks(void (*beginPanel)(bool *), void (*drawPanel)(), void (*endPanel)()) {
@@ -645,18 +703,73 @@ static volatile LONG g_mouseHookThreadId = 0; // 装钩子并 pump 消息的线�
 static volatile LONG g_mouseHookStop = 0;     // 置 1 -> pump 线程退出
 static HANDLE g_mouseHookThread = nullptr;    // pump 线程句柄
 
-// WHEEL_DELTA = 120。imgui 的 AddMouseWheelEvent 期望"格数"（1.0 = 一格），
-// 所以这里除以 120 得到格数。用整数累加，避免浮点跨线程问题。
+// 低级鼠标钩子：
+//   1) 仅当「面板可见 + 游戏窗口处于前台 + 光标位于面板矩形或弹窗/拖拽上」时拦截点击与滚轮，
+//      彻底阻止鼠标点击和滚轮穿透到明日方舟游戏画面引发误操作；
+//   2) 拦截 DOWN 时记录 g_llMouseDown[0..2] + g_llSwallowed[0..2]，对应的 UP 成对吞掉并清零，
+//      既保证 ImGui 完整响应点击/拖拽，又绝不卡键；
+//   3) 游戏窗口非前台或光标在面板外时 100% 放行，完全不干扰正常游玩和其他软件。
 static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if (nCode == HC_ACTION && wParam == WM_MOUSEWHEEL)
+    if (nCode == HC_ACTION && lParam && !g_unloadRequested)
     {
         MSLLHOOKSTRUCT *ms = (MSLLHOOKSTRUCT *)lParam;
-        if (ms)
+        const bool gameFocused = g_panelVisible && g_gameHwnd && (GetForegroundWindow() == g_gameHwnd);
+        const bool overPanel = gameFocused &&
+                               (UiPointOverPanel(ms->pt.x, ms->pt.y) ||
+                                InterlockedCompareExchange(&g_hasActivePopupOrDrag, 0, 0) != 0);
+
+        switch (wParam)
         {
-            int delta = (int)(short)HIWORD(ms->mouseData);   // 有符号：正=上滚
-            // 累加到全局；正负都加，渲染线程每帧取走
-            InterlockedExchangeAdd(&g_wheelAccum, (LONG)delta);
+        case WM_LBUTTONDOWN:
+            if (overPanel) {
+                InterlockedExchange(&g_llMouseDown[0], 1);
+                InterlockedExchange(&g_llSwallowed[0], 1);
+                return 1;
+            }
+            break;
+        case WM_LBUTTONUP:
+            InterlockedExchange(&g_llMouseDown[0], 0);
+            if (InterlockedExchange(&g_llSwallowed[0], 0) != 0)
+                return 1;
+            break;
+        case WM_RBUTTONDOWN:
+            if (overPanel) {
+                InterlockedExchange(&g_llMouseDown[1], 1);
+                InterlockedExchange(&g_llSwallowed[1], 1);
+                return 1;
+            }
+            break;
+        case WM_RBUTTONUP:
+            InterlockedExchange(&g_llMouseDown[1], 0);
+            if (InterlockedExchange(&g_llSwallowed[1], 0) != 0)
+                return 1;
+            break;
+        case WM_MBUTTONDOWN:
+            if (overPanel) {
+                InterlockedExchange(&g_llMouseDown[2], 1);
+                InterlockedExchange(&g_llSwallowed[2], 1);
+                return 1;
+            }
+            break;
+        case WM_MBUTTONUP:
+            InterlockedExchange(&g_llMouseDown[2], 0);
+            if (InterlockedExchange(&g_llSwallowed[2], 0) != 0)
+                return 1;
+            break;
+        case WM_MOUSEWHEEL:
+            if (overPanel) {
+                int delta = (int)(short)HIWORD(ms->mouseData);
+                InterlockedExchangeAdd(&g_wheelAccum, (LONG)delta);
+                return 1; // 滚轮仅滚动面板，不缩放游戏地图
+            }
+            break;
+        case WM_MOUSEHWHEEL:
+            if (overPanel)
+                return 1;
+            break;
+        default:
+            break;
         }
     }
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
@@ -780,15 +893,19 @@ static void PollMouseForImGui()
               cr.right - cr.left, cr.bottom - cr.top, g_gameHwnd);
     }
     io.AddMousePosEvent(cx, cy);
-    // 键鼠按钮：按当前状态喂（边缘触发由 io 处理）
-    bool down[5] = {
-        (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0,
-        (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0,
-        (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0,
-        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0,
-        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0,
+    // 鼠标三键：合并 WH_MOUSE_LL 拦截态与 GetAsyncKeyState（被 LL 吞掉的点击不会更新 AsyncKeyState）
+    const bool gameFocused = g_gameHwnd && (GetForegroundWindow() == g_gameHwnd);
+    if (!g_panelVisible || !gameFocused) {
+        InterlockedExchange(&g_llMouseDown[0], 0);
+        InterlockedExchange(&g_llMouseDown[1], 0);
+        InterlockedExchange(&g_llMouseDown[2], 0);
+    }
+    bool down[3] = {
+        (InterlockedCompareExchange(&g_llMouseDown[0], 0, 0) != 0) || ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0),
+        (InterlockedCompareExchange(&g_llMouseDown[1], 0, 0) != 0) || ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0),
+        (InterlockedCompareExchange(&g_llMouseDown[2], 0, 0) != 0) || ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0),
     };
-    for (int i = 0; i < 5; ++i) io.AddMouseButtonEvent(i, down[i]);
+    for (int i = 0; i < 3; ++i) io.AddMouseButtonEvent(i, down[i]);
     // ---- 鼠标滚轮 ----
     // 主路径：LL 钩子累加的 wheel delta（每格 120）。取走并清零，转成"格数"喂 imgui。
     // 备用路径：PgUp/PgDn（钩子装不上、或鼠标没滚轮时用），每帧 ±1 格。
@@ -805,6 +922,15 @@ static void PollMouseForImGui()
     bool ins = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
     if (ins && !insertDown) g_panelVisible = !g_panelVisible;
     insertDown = ins;
+
+    // 消费 ExitWndProc 推送的 UTF-16 字符队列（原生支持中文输入法 IME 及全键盘符号）
+    while (g_charTail != g_charHead) {
+        unsigned short ch = g_charRing[g_charTail];
+        MemoryBarrier();
+        g_charTail = (g_charTail + 1) & (UI_CHAR_RING_CAP - 1);
+        if (ch >= 0x20)
+            io.AddInputCharacterUTF16((ImWchar16)ch);
+    }
 
     // ---- 键盘轮询（15:55 面板数字输入需要）----
     //
@@ -878,6 +1004,10 @@ static void PollMouseForImGui()
         if (cd && !s_prevCapsKey) s_caps = !s_caps;
         s_prevCapsKey = cd;
     }
+    // 仅当 ExitWndProc 未挂接时，退回 ToUnicode 轮询（已挂接时 WM_CHAR 已精确送达中英文字符，避免重复输入）
+    if (InterlockedCompareExchange(&g_wndProcAttached, 0, 0) != 0)
+        return;
+
     for (int vk = 0; vk < 256; ++vk) {
         bool d = (GetAsyncKeyState(vk) & 0x8000) != 0;
         bool edge = d && !s_prevChar[vk];     // 按下沿（不做长按重复，够用）
@@ -1377,6 +1507,16 @@ static void ReleaseOwnedResources()
     g_origPresent = nullptr; g_origResize = nullptr;
     g_origPresentSlot = nullptr; g_origResizeSlot = nullptr;
     g_frame = 0; g_cursorOverPanel = false; g_panelRectValid = false;
+    InterlockedExchange(&g_wantCaptureMouse, 0);
+    InterlockedExchange(&g_hasActivePopupOrDrag, 0);
+    InterlockedExchange(&g_wantTextInput, 0);
+    InterlockedExchange(&g_wndProcAttached, 0);
+    InterlockedExchange(&g_llMouseDown[0], 0);
+    InterlockedExchange(&g_llMouseDown[1], 0);
+    InterlockedExchange(&g_llMouseDown[2], 0);
+    InterlockedExchange(&g_llSwallowed[0], 0);
+    InterlockedExchange(&g_llSwallowed[1], 0);
+    InterlockedExchange(&g_llSwallowed[2], 0);
 }
 
 // 在 Present 钩子开头调用：驱动整个卸载时序（全在渲染线程，安全）
