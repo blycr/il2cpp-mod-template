@@ -667,7 +667,55 @@ static int FindCharAmmoCounters(Il2CppObject *chr, Il2CppClass *ck, Il2CppObject
         }
     }
 
-    // 路径 2：扫描归属于该干员的 AbilityEventCounter（捕获特性/天赋/过载附加弹药计数器）
+    // 路径 2（零 GC 停顿）：遍历干员自身的 Entity.m_cachedAbilities (List<Ability>)，
+    // 直接检查能力对象或其内部字段（m_eventCounter/_eventCounter/m_progressSource 等），
+    // 无需全堆 STW 扫描即可捕获特性/天赋/过载弹药计数器。
+    if (FieldInfo *fCachedAb = ArkReflectFindField(ck, "m_cachedAbilities", nullptr))
+    {
+        if (Il2CppObject *abList = api.il2cpp_field_get_value_object(fCachedAb, chr))
+        {
+            Il2CppClass *lk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(abList) : abList->klass;
+            if (lk)
+            {
+                FieldInfo *fItems = ArkReflectFindField(lk, "_items", nullptr);
+                FieldInfo *fSize  = ArkReflectFindField(lk, "_size", nullptr);
+                if (fItems && fSize)
+                {
+                    int32_t sz = 0;
+                    if (void *a = ArkReflectFieldAddr(fSize, abList)) sz = *(int32_t *)a;
+                    if (sz > 0 && sz <= 256)
+                    {
+                        if (Il2CppObject *arr = api.il2cpp_field_get_value_object(fItems, abList))
+                        {
+                            int32_t arrLen = *(int32_t *)((char *)arr + 0x18);
+                            int32_t take = (sz < arrLen) ? sz : arrLen;
+                            if (take > 256) take = 256;
+                            Il2CppObject **abItems = (Il2CppObject **)((char *)arr + 0x20);
+                            static const char *kCounterFields[] = {
+                                "m_progressSource", "_progressSource",
+                                "m_eventCounter", "_eventCounter", "m_counter"
+                            };
+                            for (int i = 0; i < take && found < maxOut; ++i)
+                            {
+                                Il2CppObject *ab = abItems[i];
+                                if (!ab) continue;
+                                addUnique(ab);
+                                Il2CppClass *ak = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(ab) : ab->klass;
+                                if (!ak) continue;
+                                for (int fi = 0; fi < 5 && found < maxOut; ++fi)
+                                {
+                                    if (FieldInfo *fc = ArkReflectFindField(ak, kCounterFields[fi], nullptr))
+                                        addUnique(api.il2cpp_field_get_value_object(fc, ab));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 路径 3（仅手动按钮按需兜底，后台刷新/持续锁定绝不传入）：扫描传入的 AbilityEventCounter 列表
     if (allCounters && allCounterCount > 0 && api.il2cpp_class_get_method_from_name && api.il2cpp_runtime_invoke)
     {
         for (int i = 0; i < allCounterCount && found < maxOut; ++i)
@@ -774,6 +822,9 @@ static bool ModifyAmmoCounter(Il2CppObject *counter, int32_t targetAmmo, bool ch
     return true;
 }
 
+static Il2CppObject *GetBattleControllerFast();
+static int GetBattleCharactersFast(Il2CppObject *bc, Il2CppObject **out, int maxOut);
+
 static int ApplyCharacterAmmo(const char *filter, int32_t targetAmmo, bool changeMax,
                               int *outCharMatched, char *lastMatched, int cap,
                               int32_t *outBRem, int32_t *outBMax, int32_t *outARem, int32_t *outAMax)
@@ -781,49 +832,63 @@ static int ApplyCharacterAmmo(const char *filter, int32_t targetAmmo, bool chang
     Il2CppApi &api = ir::Api();
     if (outCharMatched) *outCharMatched = 0;
 
+    Il2CppObject *bc = GetBattleControllerFast();
     const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Character");
     if (!ce || !ce->klass) return -1;
 
     Il2CppObject *chars[256];
-    int n = ArkGcEnumObjects(ce->klass, chars, 256, 1);
-
-    Il2CppObject *allCounters[128];
-    int allCnt = 0;
-    if (const ArkClassEntry *cntCe = ArkReflectFindClass("Torappu.Battle.Abilities.AbilityEventCounter"))
-    {
-        if (cntCe->klass)
-            allCnt = ArkGcEnumObjects(cntCe->klass, allCounters, 128, 1);
-    }
+    int n = bc ? GetBattleCharactersFast(bc, chars, 256) : -1;
+    if (n < 0) n = ArkGcEnumObjects(ce->klass, chars, 256, 1);
 
     FieldInfo *fData = ArkReflectFindField(ce->klass, "<data>k__BackingField", nullptr);
     int modified = 0;
     int matchedChars = 0;
 
-    for (int i = 0; i < n; ++i)
-    {
-        Il2CppObject *chr = chars[i];
-        if (!chr || !fData || !IsEntityAlive(chr, ce->klass)) continue;
-        char desc[128] = { 0 };
-        if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, chr), filter, desc, sizeof(desc)))
-            continue;
-        ++matchedChars;
-
-        Il2CppObject *myCnts[8];
-        int k = FindCharAmmoCounters(chr, ce->klass, myCnts, 8, allCounters, allCnt);
-        for (int j = 0; j < k; ++j)
+    auto processPass = [&](Il2CppObject **allCounters, int allCnt) {
+        for (int i = 0; i < n; ++i)
         {
-            int32_t bR = 0, bM = 0, aR = 0, aM = 0;
-            if (ModifyAmmoCounter(myCnts[j], targetAmmo, changeMax, &bR, &bM, &aR, &aM))
+            Il2CppObject *chr = chars[i];
+            if (!chr || !fData || !IsEntityAlive(chr, ce->klass)) continue;
+            char desc[128] = { 0 };
+            if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, chr), filter, desc, sizeof(desc)))
+                continue;
+            if (!allCounters) ++matchedChars;
+
+            Il2CppObject *myCnts[8];
+            int k = FindCharAmmoCounters(chr, ce->klass, myCnts, 8, allCounters, allCnt);
+            for (int j = 0; j < k; ++j)
             {
-                if (outBRem) *outBRem = bR;
-                if (outBMax) *outBMax = bM;
-                if (outARem) *outARem = aR;
-                if (outAMax) *outAMax = aM;
-                CopyStrSafe(lastMatched, cap, desc);
-                ++modified;
+                int32_t bR = 0, bM = 0, aR = 0, aM = 0;
+                if (ModifyAmmoCounter(myCnts[j], targetAmmo, changeMax, &bR, &bM, &aR, &aM))
+                {
+                    if (outBRem) *outBRem = bR;
+                    if (outBMax) *outBMax = bM;
+                    if (outARem) *outARem = aR;
+                    if (outAMax) *outAMax = aM;
+                    CopyStrSafe(lastMatched, cap, desc);
+                    ++modified;
+                }
             }
         }
+    };
+
+    // 第一遍：纯零 GC 停顿路径（m_skill + m_cachedAbilities）
+    processPass(nullptr, 0);
+
+    // 仅当手动点击且零 GC 路径未命中任何弹药计数器时，才做一次按需 GC 兜底扫描
+    if (modified == 0 && matchedChars > 0)
+    {
+        Il2CppObject *allCounters[128];
+        int allCnt = 0;
+        if (const ArkClassEntry *cntCe = ArkReflectFindClass("Torappu.Battle.Abilities.AbilityEventCounter"))
+        {
+            if (cntCe->klass)
+                allCnt = ArkGcEnumObjects(cntCe->klass, allCounters, 128, 1);
+        }
+        if (allCnt > 0)
+            processPass(allCounters, allCnt);
     }
+
     if (outCharMatched) *outCharMatched = matchedChars;
     return modified;
 }
@@ -847,10 +912,176 @@ static Il2CppObject *GetBattleControllerFast()
             return inst;
         }
     }
-    Il2CppObject *bcs[4] = { nullptr };
-    if (ArkGcEnumObjects(bcCe->klass, bcs, 4, 1) > 0)
-        return bcs[0];
     return nullptr;
+}
+
+// 零 GC 停顿读取 UnorderedArray<T>（UnitManager.characters / enemies 的底层容器）
+// 返回值：>= 0 为成功读取到的数量（含 0）；-1 表示字段结构不可用。
+static int ReadUnorderedArrayObjects(Il2CppObject *uaObj, Il2CppObject **out, int maxOut, Il2CppClass *filterBase = nullptr)
+{
+    if (!uaObj || !out || maxOut <= 0) return -1;
+    Il2CppApi &api = ir::Api();
+    Il2CppClass *uk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(uaObj) : uaObj->klass;
+    if (!uk) return -1;
+
+    FieldInfo *fItems = ArkReflectFindField(uk, "m_items", nullptr);
+    FieldInfo *fCnt   = ArkReflectFindField(uk, "<count>k__BackingField", nullptr);
+    if (!fItems || !fCnt) return -1;
+
+    int32_t cnt = 0;
+    if (void *a = ArkReflectFieldAddr(fCnt, uaObj)) cnt = *(int32_t *)a;
+    if (cnt <= 0) return 0;
+
+    Il2CppObject *arr = api.il2cpp_field_get_value_object(fItems, uaObj);
+    if (!arr) return 0;
+
+    int32_t arrLen = *(int32_t *)((char *)arr + 0x18);
+    if (arrLen <= 0 || arrLen > 8192) return 0;
+    int32_t take = (cnt < arrLen) ? cnt : arrLen;
+    Il2CppObject **items = (Il2CppObject **)((char *)arr + 0x20);
+
+    int n = 0;
+    for (int32_t i = 0; i < take && n < maxOut; ++i)
+    {
+        Il2CppObject *obj = items[i];
+        if (!obj) continue;
+        if (filterBase && api.il2cpp_class_is_assignable_from)
+        {
+            Il2CppClass *ok = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(obj) : obj->klass;
+            if (!ok || !api.il2cpp_class_is_assignable_from(filterBase, ok))
+                continue;
+        }
+        out[n++] = obj;
+    }
+    return n;
+}
+
+// 零 GC 停顿读取场上所有干员：BattleController.<unitManager> -> UnitManager.<characters>
+static int GetBattleCharactersFast(Il2CppObject *bc, Il2CppObject **out, int maxOut)
+{
+    if (!bc || !out || maxOut <= 0) return -1;
+    Il2CppApi &api = ir::Api();
+    Il2CppClass *bk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bc) : bc->klass;
+    if (!bk) return -1;
+
+    FieldInfo *fUm = ArkReflectFindField(bk, "<unitManager>k__BackingField", nullptr);
+    if (!fUm) return -1;
+    Il2CppObject *um = api.il2cpp_field_get_value_object(fUm, bc);
+    if (!um) return -1;
+
+    Il2CppClass *umk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(um) : um->klass;
+    if (!umk) return -1;
+    FieldInfo *fChars = ArkReflectFindField(umk, "<characters>k__BackingField", nullptr);
+    if (!fChars) return -1;
+    Il2CppObject *ua = api.il2cpp_field_get_value_object(fChars, um);
+    const ArkClassEntry *charCe = ArkReflectFindClass("Torappu.Battle.Character");
+    return ReadUnorderedArrayObjects(ua, out, maxOut, charCe ? charCe->klass : nullptr);
+}
+
+// 零 GC 停顿读取场上所有怪物：BattleController.<unitManager> -> UnitManager.<enemies>
+static int GetBattleEnemiesFast(Il2CppObject *bc, Il2CppObject **out, int maxOut)
+{
+    if (!bc || !out || maxOut <= 0) return -1;
+    Il2CppApi &api = ir::Api();
+    Il2CppClass *bk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bc) : bc->klass;
+    if (!bk) return -1;
+
+    FieldInfo *fUm = ArkReflectFindField(bk, "<unitManager>k__BackingField", nullptr);
+    if (!fUm) return -1;
+    Il2CppObject *um = api.il2cpp_field_get_value_object(fUm, bc);
+    if (!um) return -1;
+
+    Il2CppClass *umk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(um) : um->klass;
+    if (!umk) return -1;
+    FieldInfo *fEnms = ArkReflectFindField(umk, "<enemies>k__BackingField", nullptr);
+    if (!fEnms) return -1;
+    Il2CppObject *ua = api.il2cpp_field_get_value_object(fEnms, um);
+    const ArkClassEntry *enmCe = ArkReflectFindClass("Torappu.Battle.Enemy");
+    return ReadUnorderedArrayObjects(ua, out, maxOut, enmCe ? enmCe->klass : nullptr);
+}
+
+// 零 GC 停顿读取手牌编队：BattleController.m_deckDict (List<KeyValuePair<PlayerSide, Deck>>) -> Deck.m_cards
+static int GetBattleCardsFast(Il2CppObject *bc, Il2CppObject **out, int maxOut)
+{
+    if (!bc || !out || maxOut <= 0) return -1;
+    Il2CppApi &api = ir::Api();
+    Il2CppClass *bk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bc) : bc->klass;
+    if (!bk) return -1;
+
+    FieldInfo *fDeckDict = ArkReflectFindField(bk, "m_deckDict", nullptr);
+    if (!fDeckDict) return -1;
+    Il2CppObject *dictObj = api.il2cpp_field_get_value_object(fDeckDict, bc);
+    if (!dictObj) return -1;
+
+    Il2CppClass *dk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(dictObj) : dictObj->klass;
+    if (!dk) return -1;
+
+    FieldInfo *fItems = ArkReflectFindField(dk, "_items", nullptr);
+    FieldInfo *fSize  = ArkReflectFindField(dk, "_size", nullptr);
+    if (!fItems || !fSize) return -1;
+
+    int32_t sz = 0;
+    if (void *a = ArkReflectFieldAddr(fSize, dictObj)) sz = *(int32_t *)a;
+    if (sz <= 0 || sz > 32) return 0;
+
+    Il2CppObject *kvArr = api.il2cpp_field_get_value_object(fItems, dictObj);
+    if (!kvArr) return -1;
+
+    int32_t arrLen = *(int32_t *)((char *)kvArr + 0x18);
+    if (arrLen <= 0 || arrLen > 128) return 0;
+    int32_t take = (sz < arrLen) ? sz : arrLen;
+
+    // 动态读取 KeyValuePair<PlayerSide, Deck> 的元素步长和 value 字段偏移（零硬编码假设）
+    Il2CppClass *arrKlass = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(kvArr) : kvArr->klass;
+    int elemStride = 16;
+    size_t valOffset = 8;
+    if (arrKlass && api.il2cpp_array_element_size)
+    {
+        int s = api.il2cpp_array_element_size(arrKlass);
+        if (s >= 8 && s <= 64) elemStride = s;
+    }
+    if (arrKlass && api.il2cpp_class_get_element_class && api.il2cpp_field_get_offset)
+    {
+        if (Il2CppClass *elemK = api.il2cpp_class_get_element_class(arrKlass))
+        {
+            if (FieldInfo *fVal = ArkReflectFindField(elemK, "value", nullptr))
+            {
+                size_t rawOff = api.il2cpp_field_get_offset(fVal);
+                // 值类型字段偏移在 IL2CPP 元数据中含 0x10 字节装箱头，数组内裸值需减去 0x10
+                if (rawOff >= 0x10 && (rawOff - 0x10) + sizeof(void *) <= (size_t)elemStride)
+                    valOffset = rawOff - 0x10;
+            }
+        }
+    }
+
+    char *base = (char *)kvArr + 0x20;
+    int totalCards = 0;
+    for (int32_t i = 0; i < take && totalCards < maxOut; ++i)
+    {
+        Il2CppObject *deck = *(Il2CppObject **)(base + (size_t)i * (size_t)elemStride + valOffset);
+        if (!deck) continue;
+        Il2CppClass *deckK = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(deck) : deck->klass;
+        if (!deckK) continue;
+
+        FieldInfo *fCards = ArkReflectFindField(deckK, "m_cards", nullptr);
+        if (!fCards) continue;
+        Il2CppObject *cardArr = api.il2cpp_field_get_value_object(fCards, deck);
+        if (!cardArr) continue;
+
+        int32_t clen = *(int32_t *)((char *)cardArr + 0x18);
+        if (clen <= 0 || clen > 256) continue;
+        Il2CppObject **cItems = (Il2CppObject **)((char *)cardArr + 0x20);
+        for (int32_t j = 0; j < clen && totalCards < maxOut; ++j)
+        {
+            Il2CppObject *c = cItems[j];
+            if (!c) continue;
+            bool dup = false;
+            for (int k = 0; k < totalCards; ++k)
+                if (out[k] == c) { dup = true; break; }
+            if (!dup) out[totalCards++] = c;
+        }
+    }
+    return totalCards;
 }
 
 // 零 GC 停顿读取 BattleController 当前阶段/代理指挥状态/关卡ID/逻辑帧
@@ -1144,60 +1375,59 @@ static void RefreshBattleSnapshot()
         return e;
     };
 
-    // 1) 扫描手牌编队 (Deck.CharacterCard)
-    if (const ArkClassEntry *cardCe = ArkReflectFindClass("CharacterCard"))
+    // 1) 零 GC 停顿读取手牌编队 (BattleController.m_deckDict -> Deck.m_cards)
     {
-        if (cardCe->klass)
+        Il2CppObject *cards[128];
+        int cn = GetBattleCardsFast(bc, cards, 128);
+        for (int i = 0; i < cn; ++i)
         {
-            Il2CppObject *cards[128];
-            int cn = ArkGcEnumObjects(cardCe->klass, cards, 128, 1);
-            FieldInfo *fData  = ArkReflectFindField(cardCe->klass, "m_data", nullptr);
-            FieldInfo *fDelta = ArkReflectFindField(cardCe->klass, "m_costDelta", nullptr);
-            FieldInfo *fSnap  = ArkReflectFindField(cardCe->klass, "<attributes>k__BackingField", nullptr);
+            Il2CppObject *card = cards[i];
+            if (!card) continue;
+            Il2CppClass *ck = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(card) : card->klass;
+            if (!ck) continue;
+            FieldInfo *fData  = ArkReflectFindField(ck, "m_data", nullptr);
+            FieldInfo *fDelta = ArkReflectFindField(ck, "m_costDelta", nullptr);
+            FieldInfo *fSnap  = ArkReflectFindField(ck, "<attributes>k__BackingField", nullptr);
+            if (!fData) continue;
 
-            for (int i = 0; i < cn; ++i)
+            char idBuf[96] = { 0 }, nmBuf[96] = { 0 };
+            if (!ExtractCharIdName(api.il2cpp_field_get_value_object(fData, card),
+                                   idBuf, sizeof(idBuf), nmBuf, sizeof(nmBuf)))
+                continue;
+            if (strncmp(idBuf, "char_", 5) != 0 && strncmp(idBuf, "token_", 6) != 0)
+                continue;
+
+            StageCharInfo *info = findOrAddChar(idBuf, nmBuf);
+            if (!info) continue;
+            info->inHand = true;
+
+            int32_t delta = 0;
+            if (fDelta)
             {
-                Il2CppObject *card = cards[i];
-                if (!card || !fData) continue;
-                char idBuf[96] = { 0 }, nmBuf[96] = { 0 };
-                if (!ExtractCharIdName(api.il2cpp_field_get_value_object(fData, card),
-                                       idBuf, sizeof(idBuf), nmBuf, sizeof(nmBuf)))
-                    continue;
-                if (strncmp(idBuf, "char_", 5) != 0 && strncmp(idBuf, "token_", 6) != 0)
-                    continue;
-
-                StageCharInfo *info = findOrAddChar(idBuf, nmBuf);
-                if (!info) continue;
-                info->inHand = true;
-
-                int32_t delta = 0;
-                if (fDelta)
+                if (void *a = ArkReflectFieldAddr(fDelta, card)) delta = *(int32_t *)a;
+            }
+            if (fSnap)
+            {
+                if (Il2CppObject *snap = api.il2cpp_field_get_value_object(fSnap, card))
                 {
-                    if (void *a = ArkReflectFieldAddr(fDelta, card)) delta = *(int32_t *)a;
-                }
-                if (fSnap)
-                {
-                    if (Il2CppObject *snap = api.il2cpp_field_get_value_object(fSnap, card))
+                    Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(snap) : snap->klass;
+                    if (sk)
                     {
-                        Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(snap) : snap->klass;
-                        if (sk)
+                        if (FieldInfo *fAttr = ArkReflectFindField(sk, "m_attributes", nullptr))
                         {
-                            if (FieldInfo *fAttr = ArkReflectFindField(sk, "m_attributes", nullptr))
+                            if (Il2CppObject *attrObj = api.il2cpp_field_get_value_object(fAttr, snap))
                             {
-                                if (Il2CppObject *attrObj = api.il2cpp_field_get_value_object(fAttr, snap))
-                                {
-                                    int baseCost = (int)floorf(ReadAttributeOnObj(attrObj, 4) + 0.5f);
-                                    int effCost = baseCost + delta;
-                                    info->cost        = effCost < 0 ? 0 : effCost;
-                                    info->maxHp       = ReadAttributeOnObj(attrObj, 0);
-                                    info->hp          = info->maxHp;
-                                    info->atk         = ReadAttributeOnObj(attrObj, 1);
-                                    info->def         = ReadAttributeOnObj(attrObj, 2);
-                                    info->magicRes    = ReadAttributeOnObj(attrObj, 3);
-                                    info->blockCnt    = ReadAttributeOnObj(attrObj, 5);
-                                    info->atkSpd      = ReadAttributeOnObj(attrObj, 7);
-                                    info->baseAtkTime = ReadAttributeOnObj(attrObj, 8);
-                                }
+                                int baseCost = (int)floorf(ReadAttributeOnObj(attrObj, 4) + 0.5f);
+                                int effCost = baseCost + delta;
+                                info->cost        = effCost < 0 ? 0 : effCost;
+                                info->maxHp       = ReadAttributeOnObj(attrObj, 0);
+                                info->hp          = info->maxHp;
+                                info->atk         = ReadAttributeOnObj(attrObj, 1);
+                                info->def         = ReadAttributeOnObj(attrObj, 2);
+                                info->magicRes    = ReadAttributeOnObj(attrObj, 3);
+                                info->blockCnt    = ReadAttributeOnObj(attrObj, 5);
+                                info->atkSpd      = ReadAttributeOnObj(attrObj, 7);
+                                info->baseAtkTime = ReadAttributeOnObj(attrObj, 8);
                             }
                         }
                     }
@@ -1206,137 +1436,134 @@ static void RefreshBattleSnapshot()
         }
     }
 
-    // 2) 扫描场上存活干员 (Torappu.Battle.Character) + 弹药计数器
-    Il2CppObject *allCounters[128];
-    int allCnt = 0;
-    if (const ArkClassEntry *cntCe = ArkReflectFindClass("Torappu.Battle.Abilities.AbilityEventCounter"))
+    // 2) 零 GC 停顿读取场上存活干员 (UnitManager.characters) + 零 GC 弹药计数器
     {
-        if (cntCe->klass)
-            allCnt = ArkGcEnumObjects(cntCe->klass, allCounters, 128, 1);
-    }
+        Il2CppObject *chars[256];
+        int n = GetBattleCharactersFast(bc, chars, 256);
+        const ArkClassEntry *charCe = ArkReflectFindClass("Torappu.Battle.Character");
+        Il2CppClass *baseCk = charCe ? charCe->klass : nullptr;
 
-    if (const ArkClassEntry *charCe = ArkReflectFindClass("Torappu.Battle.Character"))
-    {
-        if (charCe->klass)
+        for (int i = 0; i < n; ++i)
         {
-            Il2CppObject *chars[256];
-            int n = ArkGcEnumObjects(charCe->klass, chars, 256, 1);
-            FieldInfo *fData  = ArkReflectFindField(charCe->klass, "<data>k__BackingField", nullptr);
-            FieldInfo *fAttr  = ArkReflectFindField(charCe->klass, "m_attributes", nullptr);
-            FieldInfo *fHp    = ArkReflectFindField(charCe->klass, "m_hp", nullptr);
-            FieldInfo *fSp    = ArkReflectFindField(charCe->klass, "m_sp", nullptr);
-            FieldInfo *fMaxSp = ArkReflectFindField(charCe->klass, "<maxSp>k__BackingField", nullptr);
+            Il2CppObject *chr = chars[i];
+            if (!chr) continue;
+            Il2CppClass *ck = baseCk ? baseCk : (api.il2cpp_object_get_class ? api.il2cpp_object_get_class(chr) : chr->klass);
+            if (!ck || !IsEntityAlive(chr, ck)) continue;
 
-            for (int i = 0; i < n; ++i)
+            FieldInfo *fData  = ArkReflectFindField(ck, "<data>k__BackingField", nullptr);
+            FieldInfo *fAttr  = ArkReflectFindField(ck, "m_attributes", nullptr);
+            FieldInfo *fHp    = ArkReflectFindField(ck, "m_hp", nullptr);
+            FieldInfo *fSp    = ArkReflectFindField(ck, "m_sp", nullptr);
+            FieldInfo *fMaxSp = ArkReflectFindField(ck, "<maxSp>k__BackingField", nullptr);
+            if (!fData) continue;
+
+            char idBuf[96] = { 0 }, nmBuf[96] = { 0 };
+            if (!ExtractCharIdName(api.il2cpp_field_get_value_object(fData, chr),
+                                   idBuf, sizeof(idBuf), nmBuf, sizeof(nmBuf)))
+                continue;
+            if (strncmp(idBuf, "char_", 5) != 0 && strncmp(idBuf, "token_", 6) != 0)
+                continue;
+
+            StageCharInfo *info = findOrAddChar(idBuf, nmBuf);
+            if (!info) continue;
+            info->deployed = true;
+
+            if (fAttr)
             {
-                Il2CppObject *chr = chars[i];
-                if (!chr || !fData || !IsEntityAlive(chr, charCe->klass)) continue;
-                char idBuf[96] = { 0 }, nmBuf[96] = { 0 };
-                if (!ExtractCharIdName(api.il2cpp_field_get_value_object(fData, chr),
-                                       idBuf, sizeof(idBuf), nmBuf, sizeof(nmBuf)))
-                    continue;
-                if (strncmp(idBuf, "char_", 5) != 0 && strncmp(idBuf, "token_", 6) != 0)
-                    continue;
+                if (Il2CppObject *attrObj = api.il2cpp_field_get_value_object(fAttr, chr))
+                {
+                    info->maxHp       = ReadAttributeOnObj(attrObj, 0);
+                    info->atk         = ReadAttributeOnObj(attrObj, 1);
+                    info->def         = ReadAttributeOnObj(attrObj, 2);
+                    info->magicRes    = ReadAttributeOnObj(attrObj, 3);
+                    info->blockCnt    = ReadAttributeOnObj(attrObj, 5);
+                    info->atkSpd      = ReadAttributeOnObj(attrObj, 7);
+                    info->baseAtkTime = ReadAttributeOnObj(attrObj, 8);
+                }
+            }
+            if (fHp)
+            {
+                if (void *a = ArkReflectFieldAddr(fHp, chr))
+                    info->hp = (float)((double)(*(int64_t *)a) / 4294967296.0);
+            }
+            if (fSp)
+            {
+                if (void *a = ArkReflectFieldAddr(fSp, chr))
+                    info->sp = ReadObscuredFpSlot(a);
+            }
+            if (fMaxSp)
+            {
+                if (void *a = ArkReflectFieldAddr(fMaxSp, chr))
+                    info->maxSp = (float)(*(int32_t *)a);
+            }
 
-                StageCharInfo *info = findOrAddChar(idBuf, nmBuf);
-                if (!info) continue;
-                info->deployed = true;
-
-                if (fAttr)
+            Il2CppObject *myCnts[4];
+            if (FindCharAmmoCounters(chr, ck, myCnts, 4, nullptr, 0) > 0)
+            {
+                int32_t r = 0, m = 0;
+                if (IsCounterValid(myCnts[0], &r, &m))
                 {
-                    if (Il2CppObject *attrObj = api.il2cpp_field_get_value_object(fAttr, chr))
-                    {
-                        info->maxHp       = ReadAttributeOnObj(attrObj, 0);
-                        info->atk         = ReadAttributeOnObj(attrObj, 1);
-                        info->def         = ReadAttributeOnObj(attrObj, 2);
-                        info->magicRes    = ReadAttributeOnObj(attrObj, 3);
-                        info->blockCnt    = ReadAttributeOnObj(attrObj, 5);
-                        info->atkSpd      = ReadAttributeOnObj(attrObj, 7);
-                        info->baseAtkTime = ReadAttributeOnObj(attrObj, 8);
-                    }
-                }
-                if (fHp)
-                {
-                    if (void *a = ArkReflectFieldAddr(fHp, chr))
-                        info->hp = (float)((double)(*(int64_t *)a) / 4294967296.0);
-                }
-                if (fSp)
-                {
-                    if (void *a = ArkReflectFieldAddr(fSp, chr))
-                        info->sp = ReadObscuredFpSlot(a);
-                }
-                if (fMaxSp)
-                {
-                    if (void *a = ArkReflectFieldAddr(fMaxSp, chr))
-                        info->maxSp = (float)(*(int32_t *)a);
-                }
-
-                Il2CppObject *myCnts[4];
-                if (FindCharAmmoCounters(chr, charCe->klass, myCnts, 4, allCounters, allCnt) > 0)
-                {
-                    int32_t r = 0, m = 0;
-                    if (IsCounterValid(myCnts[0], &r, &m))
-                    {
-                        info->hasAmmo = true;
-                        info->ammoRem = r;
-                        info->ammoMax = m;
-                    }
+                    info->hasAmmo = true;
+                    info->ammoRem = r;
+                    info->ammoMax = m;
                 }
             }
         }
     }
 
-    // 3) 扫描场上存活怪物 (Torappu.Battle.Enemy)
+    // 3) 零 GC 停顿读取场上存活怪物 (UnitManager.enemies)
     LiveEnemyGroup tmpEnemies[32];
     int eGrpCount = 0;
     int eTotal = 0;
-    if (const ArkClassEntry *eCe = ArkReflectFindClass("Torappu.Battle.Enemy"))
     {
-        if (eCe->klass)
+        Il2CppObject *enms[256];
+        int en = GetBattleEnemiesFast(bc, enms, 256);
+        const ArkClassEntry *eCe = ArkReflectFindClass("Torappu.Battle.Enemy");
+        Il2CppClass *baseEk = eCe ? eCe->klass : nullptr;
+
+        for (int i = 0; i < en; ++i)
         {
-            Il2CppObject *enms[256];
-            int en = ArkGcEnumObjects(eCe->klass, enms, 256, 1);
-            FieldInfo *fAttr = ArkReflectFindField(eCe->klass, "m_attributes", nullptr);
-            FieldInfo *fHp   = ArkReflectFindField(eCe->klass, "m_hp", nullptr);
+            Il2CppObject *enm = enms[i];
+            if (!enm) continue;
+            Il2CppClass *ek = baseEk ? baseEk : (api.il2cpp_object_get_class ? api.il2cpp_object_get_class(enm) : enm->klass);
+            if (!ek || !IsEntityAlive(enm, ek)) continue;
 
-            for (int i = 0; i < en; ++i)
+            FieldInfo *fAttr = ArkReflectFindField(ek, "m_attributes", nullptr);
+            FieldInfo *fHp   = ArkReflectFindField(ek, "m_hp", nullptr);
+
+            char keyBuf[96] = { 0 }, nmBuf[96] = { 0 };
+            if (!ExtractEnemyKeyName(enm, ek, keyBuf, sizeof(keyBuf), nmBuf, sizeof(nmBuf)))
+                continue;
+            ++eTotal;
+
+            LiveEnemyGroup *grp = nullptr;
+            for (int g = 0; g < eGrpCount; ++g)
             {
-                Il2CppObject *enm = enms[i];
-                if (!enm || !IsEntityAlive(enm, eCe->klass)) continue;
-                char keyBuf[96] = { 0 }, nmBuf[96] = { 0 };
-                if (!ExtractEnemyKeyName(enm, eCe->klass, keyBuf, sizeof(keyBuf), nmBuf, sizeof(nmBuf)))
-                    continue;
-                ++eTotal;
-
-                LiveEnemyGroup *grp = nullptr;
-                for (int g = 0; g < eGrpCount; ++g)
-                {
-                    if (strcmp(tmpEnemies[g].key, keyBuf) == 0) { grp = &tmpEnemies[g]; break; }
-                }
-                if (!grp && eGrpCount < 32)
-                {
-                    grp = &tmpEnemies[eGrpCount++];
-                    memset(grp, 0, sizeof(*grp));
-                    CopyStrSafe(grp->key, sizeof(grp->key), keyBuf);
-                    CopyStrSafe(grp->name, sizeof(grp->name), nmBuf);
-                    if (fAttr)
-                    {
-                        if (Il2CppObject *attrObj = api.il2cpp_field_get_value_object(fAttr, enm))
-                        {
-                            grp->maxHp   = ReadAttributeOnObj(attrObj, 0);
-                            grp->atk     = ReadAttributeOnObj(attrObj, 1);
-                            grp->def     = ReadAttributeOnObj(attrObj, 2);
-                            grp->moveSpd = ReadAttributeOnObj(attrObj, 6);
-                        }
-                    }
-                    if (fHp)
-                    {
-                        if (void *a = ArkReflectFieldAddr(fHp, enm))
-                            grp->hp = (float)((double)(*(int64_t *)a) / 4294967296.0);
-                    }
-                }
-                if (grp) grp->count++;
+                if (strcmp(tmpEnemies[g].key, keyBuf) == 0) { grp = &tmpEnemies[g]; break; }
             }
+            if (!grp && eGrpCount < 32)
+            {
+                grp = &tmpEnemies[eGrpCount++];
+                memset(grp, 0, sizeof(*grp));
+                CopyStrSafe(grp->key, sizeof(grp->key), keyBuf);
+                CopyStrSafe(grp->name, sizeof(grp->name), nmBuf);
+                if (fAttr)
+                {
+                    if (Il2CppObject *attrObj = api.il2cpp_field_get_value_object(fAttr, enm))
+                    {
+                        grp->maxHp   = ReadAttributeOnObj(attrObj, 0);
+                        grp->atk     = ReadAttributeOnObj(attrObj, 1);
+                        grp->def     = ReadAttributeOnObj(attrObj, 2);
+                        grp->moveSpd = ReadAttributeOnObj(attrObj, 6);
+                    }
+                }
+                if (fHp)
+                {
+                    if (void *a = ArkReflectFieldAddr(fHp, enm))
+                        grp->hp = (float)((double)(*(int64_t *)a) / 4294967296.0);
+                }
+            }
+            if (grp) grp->count++;
         }
     }
 
@@ -1355,24 +1582,26 @@ static void RefreshBattleSnapshot()
 static int ApplyCardCostDelta(const char *filter, int32_t costDelta, char *lastMatched, int cap)
 {
     Il2CppApi &api = ir::Api();
+    Il2CppObject *bc = GetBattleControllerFast();
     const ArkClassEntry *ce = ArkReflectFindClass("CharacterCard");
-    if (!ce || !ce->klass) return -1;
 
     Il2CppObject *objs[128];
-    int n = ArkGcEnumObjects(ce->klass, objs, 128, 1);
+    int n = bc ? GetBattleCardsFast(bc, objs, 128) : -1;
+    if (n < 0 && ce && ce->klass) n = ArkGcEnumObjects(ce->klass, objs, 128, 1);
     if (n <= 0) return 0;
-
-    FieldInfo *fData  = ArkReflectFindField(ce->klass, "m_data", nullptr);
-    FieldInfo *fDelta = ArkReflectFindField(ce->klass, "m_costDelta", nullptr);
-    FieldInfo *fSnap  = ArkReflectFindField(ce->klass, "<attributes>k__BackingField", nullptr);
-    FieldInfo *fDeck  = ArkReflectFindField(ce->klass, "m_deck", nullptr);
-    if (!fData || !fDelta) return -2;
 
     int hit = 0;
     for (int i = 0; i < n; ++i)
     {
         Il2CppObject *card = objs[i];
         if (!card) continue;
+        Il2CppClass *ck = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(card) : card->klass;
+        if (!ck) continue;
+        FieldInfo *fData  = ArkReflectFindField(ck, "m_data", nullptr);
+        FieldInfo *fDelta = ArkReflectFindField(ck, "m_costDelta", nullptr);
+        FieldInfo *fSnap  = ArkReflectFindField(ck, "<attributes>k__BackingField", nullptr);
+        FieldInfo *fDeck  = ArkReflectFindField(ck, "m_deck", nullptr);
+        if (!fData || !fDelta) continue;
         Il2CppObject *dataObj = api.il2cpp_field_get_value_object(fData, card);
         char desc[128] = { 0 };
         if (!CheckCharDataMatches(dataObj, filter, desc, sizeof(desc)))
@@ -1432,30 +1661,35 @@ static int ApplyCardCostDelta(const char *filter, int32_t costDelta, char *lastM
 static int ApplyCardResetRespawn(const char *filter, char *lastMatched, int cap)
 {
     Il2CppApi &api = ir::Api();
+    Il2CppObject *bc = GetBattleControllerFast();
     const ArkClassEntry *ce = ArkReflectFindClass("CharacterCard");
-    if (!ce || !ce->klass) return -1;
 
     Il2CppObject *objs[128];
-    int n = ArkGcEnumObjects(ce->klass, objs, 128, 1);
+    int n = bc ? GetBattleCardsFast(bc, objs, 128) : -1;
+    if (n < 0 && ce && ce->klass) n = ArkGcEnumObjects(ce->klass, objs, 128, 1);
     if (n <= 0) return 0;
-
-    FieldInfo *fData = ArkReflectFindField(ce->klass, "m_data", nullptr);
-    FieldInfo *fSnap = ArkReflectFindField(ce->klass, "<attributes>k__BackingField", nullptr);
-    MethodInfo *mReset = api.il2cpp_class_get_method_from_name(ce->klass, "ResetRespawnTime", 1);
-    if (!mReset)
-    {
-        if (Il2CppClass *parent = api.il2cpp_class_get_parent(ce->klass))
-            mReset = api.il2cpp_class_get_method_from_name(parent, "ResetRespawnTime", 1);
-    }
 
     int hit = 0;
     for (int i = 0; i < n; ++i)
     {
         Il2CppObject *card = objs[i];
-        if (!card || !fData) continue;
+        if (!card) continue;
+        Il2CppClass *ck = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(card) : card->klass;
+        if (!ck) continue;
+        FieldInfo *fData = ArkReflectFindField(ck, "m_data", nullptr);
+        FieldInfo *fSnap = ArkReflectFindField(ck, "<attributes>k__BackingField", nullptr);
+        if (!fData) continue;
         char desc[128] = { 0 };
         if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, card), filter, desc, sizeof(desc)))
             continue;
+
+        MethodInfo *mReset = nullptr;
+        Il2CppClass *cur = ck;
+        while (cur && !mReset)
+        {
+            mReset = api.il2cpp_class_get_method_from_name(cur, "ResetRespawnTime", 1);
+            cur = api.il2cpp_class_get_parent(cur);
+        }
 
         if (fSnap)
         {
@@ -1489,46 +1723,48 @@ static int ApplyFreeDeployLimit(const char *filter)
 {
     Il2CppApi &api = ir::Api();
     int hit = 0;
+    Il2CppObject *bc = GetBattleControllerFast();
 
-    if (const ArkClassEntry *ce = ArkReflectFindClass("CharacterCard"))
     {
-        if (ce->klass)
+        Il2CppObject *objs[128];
+        int n = bc ? GetBattleCardsFast(bc, objs, 128) : -1;
+        if (n < 0)
         {
-            Il2CppObject *objs[128];
-            int n = ArkGcEnumObjects(ce->klass, objs, 128, 1);
-            FieldInfo *fData  = ArkReflectFindField(ce->klass, "m_data", nullptr);
-            FieldInfo *fDont1 = ArkReflectFindField(ce->klass, "m_dontOccupyDeployCnt", nullptr);
-            FieldInfo *fDont2 = ArkReflectFindField(ce->klass, "m_dontOccupyMaxDeployCnt", nullptr);
-            for (int i = 0; i < n; ++i)
-            {
-                Il2CppObject *card = objs[i];
-                if (!card || !fData) continue;
-                char desc[128] = { 0 };
-                if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, card), filter, desc, sizeof(desc)))
-                    continue;
-                if (fDont1) ArkReflectWriteFieldNum(fDont1, card, 1.0);
-                if (fDont2) ArkReflectWriteFieldNum(fDont2, card, 1.0);
-                ++hit;
-            }
+            if (const ArkClassEntry *ce = ArkReflectFindClass("CharacterCard"))
+                if (ce->klass) n = ArkGcEnumObjects(ce->klass, objs, 128, 1);
+        }
+        for (int i = 0; i < n; ++i)
+        {
+            Il2CppObject *card = objs[i];
+            if (!card) continue;
+            Il2CppClass *ck = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(card) : card->klass;
+            if (!ck) continue;
+            FieldInfo *fData  = ArkReflectFindField(ck, "m_data", nullptr);
+            FieldInfo *fDont1 = ArkReflectFindField(ck, "m_dontOccupyDeployCnt", nullptr);
+            FieldInfo *fDont2 = ArkReflectFindField(ck, "m_dontOccupyMaxDeployCnt", nullptr);
+            if (!fData) continue;
+            char desc[128] = { 0 };
+            if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, card), filter, desc, sizeof(desc)))
+                continue;
+            if (fDont1) ArkReflectWriteFieldNum(fDont1, card, 1.0);
+            if (fDont2) ArkReflectWriteFieldNum(fDont2, card, 1.0);
+            ++hit;
         }
     }
 
-    if (const ArkClassEntry *bcCe = ArkReflectFindClass("Torappu.Battle.BattleController"))
+    if (bc)
     {
-        if (bcCe->klass)
+        Il2CppClass *bcKlass = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(bc) : bc->klass;
+        if (bcKlass)
         {
-            Il2CppObject *bcs[8];
-            if (ArkGcEnumObjects(bcCe->klass, bcs, 8, 1) > 0 && bcs[0])
+            if (MethodInfo *mModLim = api.il2cpp_class_get_method_from_name(bcKlass, "ModifyCharacterLimit", 3))
             {
-                if (MethodInfo *mModLim = api.il2cpp_class_get_method_from_name(bcCe->klass, "ModifyCharacterLimit", 3))
-                {
-                    int32_t addVal = 99;
-                    Il2CppObject *src = nullptr;
-                    int32_t side = 0;
-                    void *args[3] = { &addVal, src, &side };
-                    Il2CppException *exc = nullptr;
-                    api.il2cpp_runtime_invoke(mModLim, bcs[0], args, &exc);
-                }
+                int32_t addVal = 99;
+                Il2CppObject *src = nullptr;
+                int32_t side = 0;
+                void *args[3] = { &addVal, src, &side };
+                Il2CppException *exc = nullptr;
+                api.il2cpp_runtime_invoke(mModLim, bc, args, &exc);
             }
         }
     }
@@ -1540,13 +1776,15 @@ static int ApplyCharacterAttribute(const char *filter, int32_t attrType, float v
 {
     Il2CppApi &api = ir::Api();
     int hit = 0;
+    Il2CppObject *bc = GetBattleControllerFast();
 
     if (const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Character"))
     {
         if (ce->klass)
         {
             Il2CppObject *objs[256];
-            int n = ArkGcEnumObjects(ce->klass, objs, 256, 1);
+            int n = bc ? GetBattleCharactersFast(bc, objs, 256) : -1;
+            if (n < 0) n = ArkGcEnumObjects(ce->klass, objs, 256, 1);
             FieldInfo *fData = ArkReflectFindField(ce->klass, "<data>k__BackingField", nullptr);
             FieldInfo *fId   = ArkReflectFindField(ce->klass, "<id>k__BackingField", nullptr);
             FieldInfo *fAttr = ArkReflectFindField(ce->klass, "m_attributes", nullptr);
@@ -1593,33 +1831,37 @@ static int ApplyCharacterAttribute(const char *filter, int32_t attrType, float v
         }
     }
 
-    // 同步写入手牌快照
-    if (const ArkClassEntry *cardCe = ArkReflectFindClass("CharacterCard"))
+    // 同步写入手牌快照（零 GC 直读）
     {
-        if (cardCe->klass)
+        Il2CppObject *cards[128];
+        int cn = bc ? GetBattleCardsFast(bc, cards, 128) : -1;
+        if (cn < 0)
         {
-            Il2CppObject *cards[128];
-            int cn = ArkGcEnumObjects(cardCe->klass, cards, 128, 1);
-            FieldInfo *fData = ArkReflectFindField(cardCe->klass, "m_data", nullptr);
-            FieldInfo *fSnap = ArkReflectFindField(cardCe->klass, "<attributes>k__BackingField", nullptr);
-            for (int i = 0; i < cn; ++i)
+            if (const ArkClassEntry *cardCe = ArkReflectFindClass("CharacterCard"))
+                if (cardCe->klass) cn = ArkGcEnumObjects(cardCe->klass, cards, 128, 1);
+        }
+        for (int i = 0; i < cn; ++i)
+        {
+            Il2CppObject *card = cards[i];
+            if (!card) continue;
+            Il2CppClass *ck = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(card) : card->klass;
+            if (!ck) continue;
+            FieldInfo *fData = ArkReflectFindField(ck, "m_data", nullptr);
+            FieldInfo *fSnap = ArkReflectFindField(ck, "<attributes>k__BackingField", nullptr);
+            if (!fData || !fSnap) continue;
+            char desc[128] = { 0 };
+            if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, card), filter, desc, sizeof(desc)))
+                continue;
+            Il2CppObject *snap = api.il2cpp_field_get_value_object(fSnap, card);
+            if (!snap) continue;
+            Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(snap) : snap->klass;
+            if (!sk) continue;
+            if (FieldInfo *fInnerAttr = ArkReflectFindField(sk, "m_attributes", nullptr))
             {
-                Il2CppObject *card = cards[i];
-                if (!card || !fData || !fSnap) continue;
-                char desc[128] = { 0 };
-                if (!CheckCharDataMatches(api.il2cpp_field_get_value_object(fData, card), filter, desc, sizeof(desc)))
-                    continue;
-                Il2CppObject *snap = api.il2cpp_field_get_value_object(fSnap, card);
-                if (!snap) continue;
-                Il2CppClass *sk = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(snap) : snap->klass;
-                if (!sk) continue;
-                if (FieldInfo *fInnerAttr = ArkReflectFindField(sk, "m_attributes", nullptr))
+                if (Il2CppObject *innerAttr = api.il2cpp_field_get_value_object(fInnerAttr, snap))
                 {
-                    if (Il2CppObject *innerAttr = api.il2cpp_field_get_value_object(fInnerAttr, snap))
-                    {
-                        if (OverwriteAttributeOnObj(innerAttr, attrType, val) && hit == 0)
-                            CopyStrSafe(lastMatched, cap, desc);
-                    }
+                    if (OverwriteAttributeOnObj(innerAttr, attrType, val) && hit == 0)
+                        CopyStrSafe(lastMatched, cap, desc);
                 }
             }
         }
@@ -1633,8 +1875,10 @@ static int ApplyCharacterFullHpSp(const char *filter, char *lastMatched, int cap
     const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Character");
     if (!ce || !ce->klass) return 0;
 
+    Il2CppObject *bc = GetBattleControllerFast();
     Il2CppObject *objs[256];
-    int n = ArkGcEnumObjects(ce->klass, objs, 256, 1);
+    int n = bc ? GetBattleCharactersFast(bc, objs, 256) : -1;
+    if (n < 0) n = ArkGcEnumObjects(ce->klass, objs, 256, 1);
     FieldInfo *fData = ArkReflectFindField(ce->klass, "<data>k__BackingField", nullptr);
     FieldInfo *fAttr = ArkReflectFindField(ce->klass, "m_attributes", nullptr);
 
@@ -1717,8 +1961,10 @@ static int ApplyEnemyAttribute(const char *filter, int32_t attrType, float val,
     const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Enemy");
     if (!ce || !ce->klass) return -1;
 
+    Il2CppObject *bc = GetBattleControllerFast();
     Il2CppObject *objs[256];
-    int n = ArkGcEnumObjects(ce->klass, objs, 256, 1);
+    int n = bc ? GetBattleEnemiesFast(bc, objs, 256) : -1;
+    if (n < 0) n = ArkGcEnumObjects(ce->klass, objs, 256, 1);
     FieldInfo *fAttr = ArkReflectFindField(ce->klass, "m_attributes", nullptr);
     if (!fAttr) return -2;
 
@@ -1752,8 +1998,10 @@ static int ApplyEnemyUnharmful(const char *filter, char *lastMatched, int cap)
     const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Enemy");
     if (!ce || !ce->klass) return 0;
 
+    Il2CppObject *bc = GetBattleControllerFast();
     Il2CppObject *objs[256];
-    int n = ArkGcEnumObjects(ce->klass, objs, 256, 1);
+    int n = bc ? GetBattleEnemiesFast(bc, objs, 256) : -1;
+    if (n < 0) n = ArkGcEnumObjects(ce->klass, objs, 256, 1);
     FieldInfo *fLpRed = ArkReflectFindField(ce->klass, "<lifePointReduce>k__BackingField", nullptr);
     MethodInfo *mUnharm = api.il2cpp_class_get_method_from_name(ce->klass, "MarkUnharmful", 0);
 
@@ -1784,8 +2032,10 @@ static int ApplyEnemyKill(const char *filter, char *lastMatched, int cap)
     const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Enemy");
     if (!ce || !ce->klass) return 0;
 
+    Il2CppObject *bc = GetBattleControllerFast();
     Il2CppObject *objs[256];
-    int n = ArkGcEnumObjects(ce->klass, objs, 256, 1);
+    int n = bc ? GetBattleEnemiesFast(bc, objs, 256) : -1;
+    if (n < 0) n = ArkGcEnumObjects(ce->klass, objs, 256, 1);
 
     MethodInfo *mKill = nullptr;
     Il2CppClass *cur = ce->klass;
@@ -1820,7 +2070,7 @@ static int ApplyEnemyKill(const char *filter, char *lastMatched, int cap)
 }
 
 // ============================================================================
-// 持续自动锁定驱动（每 100ms 由 Worker 线程执行，仅战斗中生效）
+// 持续自动锁定驱动（每 200ms 由 Worker 线程执行，100% 零 GC 停顿直读）
 // ============================================================================
 static void PumpPersistentLocks()
 {
@@ -1835,21 +2085,18 @@ static void PumpPersistentLocks()
         return;
 
     Il2CppApi &api = ir::Api();
+    Il2CppObject *bc = GetBattleControllerFast();
+    if (!bc) return;
+
     const ArkClassEntry *ce = ArkReflectFindClass("Torappu.Battle.Character");
     if (!ce || !ce->klass) return;
 
     Il2CppObject *chars[256];
-    int n = ArkGcEnumObjects(ce->klass, chars, 256, 1);
+    int n = GetBattleCharactersFast(bc, chars, 256);
+    if (n <= 0) return;
+
     FieldInfo *fData = ArkReflectFindField(ce->klass, "<data>k__BackingField", nullptr);
     FieldInfo *fAttr = ArkReflectFindField(ce->klass, "m_attributes", nullptr);
-
-    Il2CppObject *allCounters[128];
-    int allCnt = 0;
-    if (lockAmmo)
-    {
-        if (const ArkClassEntry *cntCe = ArkReflectFindClass("Torappu.Battle.Abilities.AbilityEventCounter"))
-            if (cntCe->klass) allCnt = ArkGcEnumObjects(cntCe->klass, allCounters, 128, 1);
-    }
 
     char targetFilter[128];
     CopyStrSafe(targetFilter, sizeof(targetFilter), g_selectedCharId);
@@ -1880,7 +2127,7 @@ static void PumpPersistentLocks()
         if (lockAmmo)
         {
             Il2CppObject *myCnts[8];
-            int k = FindCharAmmoCounters(chr, ce->klass, myCnts, 8, allCounters, allCnt);
+            int k = FindCharAmmoCounters(chr, ce->klass, myCnts, 8, nullptr, 0);
             for (int j = 0; j < k; ++j)
             {
                 Il2CppClass *cc = api.il2cpp_object_get_class ? api.il2cpp_object_get_class(myCnts[j]) : myCnts[j]->klass;
@@ -2303,16 +2550,14 @@ static void ConsumeRequest()
             SetFeedback(FB_WARN, "上一次调速任务仍在主线程排队中");
             break;
         }
-        const ArkClassEntry *bcCe = ArkReflectFindClass("Torappu.Battle.BattleController");
-        Il2CppObject *bcs[8] = { nullptr };
-        int bcn = (bcCe && bcCe->klass) ? ArkGcEnumObjects(bcCe->klass, bcs, 8, 1) : 0;
-        if (bcn <= 0 || !bcs[0])
+        Il2CppObject *bc = GetBattleControllerFast();
+        if (!bc)
         {
             InterlockedExchange(&g_mainSpeedBusy, 0);
             SetFeedback(FB_WARN, "调速未生效：当前不在战斗关卡中");
             break;
         }
-        g_mainSpeedCtx.bcHandle   = ArkGcPin(bcs[0]);
+        g_mainSpeedCtx.bcHandle   = ArkGcPin(bc);
         g_mainSpeedCtx.mode       = g_req.extraInt1;
         g_mainSpeedCtx.speedLevel = g_req.extraInt2;
         g_mainSpeedCtx.timeScale  = g_req.val;
@@ -2414,17 +2659,15 @@ static void ConsumeRequest()
             CopyStrSafe(g_spawnEnemyKey, sizeof(g_spawnEnemyKey), keyToUse);
         }
 
-        const ArkClassEntry *bcCe = ArkReflectFindClass("Torappu.Battle.BattleController");
-        Il2CppObject *bcs[8] = { nullptr };
-        int bcn = (bcCe && bcCe->klass) ? ArkGcEnumObjects(bcCe->klass, bcs, 8, 1) : 0;
-        if (bcn <= 0 || !bcs[0] || !keyToUse || !keyToUse[0])
+        Il2CppObject *bc = GetBattleControllerFast();
+        if (!bc || !keyToUse || !keyToUse[0])
         {
             InterlockedExchange(&g_mainSpawnBusy, 0);
             SetFeedback(FB_WARN, "刷怪未生效：未在战斗关卡中或未选定本关怪物");
             break;
         }
 
-        g_mainSpawnCtx.bcHandle    = ArkGcPin(bcs[0]);
+        g_mainSpawnCtx.bcHandle    = ArkGcPin(bc);
         CopyStrSafe(g_mainSpawnCtx.enemyKey, sizeof(g_mainSpawnCtx.enemyKey), keyToUse);
         g_mainSpawnCtx.routeIdx    = g_req.extraInt1;
         g_mainSpawnCtx.count       = g_req.extraInt2;

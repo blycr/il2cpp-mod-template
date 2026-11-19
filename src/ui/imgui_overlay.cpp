@@ -711,10 +711,14 @@ static HANDLE g_mouseHookThread = nullptr;    // pump 线程句柄
 //   3) 游戏窗口非前台或光标在面板外时 100% 放行，完全不干扰正常游玩和其他软件。
 static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if (nCode == HC_ACTION && lParam && !g_unloadRequested)
+    // 鼠标移动事件（500~1000Hz 高频）本钩子永不拦截，直接 0 开销秒放行，杜绝拖动发粘
+    if (nCode != HC_ACTION || !lParam || g_unloadRequested || wParam == WM_MOUSEMOVE)
+        return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+
+    if (g_panelVisible)
     {
         MSLLHOOKSTRUCT *ms = (MSLLHOOKSTRUCT *)lParam;
-        const bool gameFocused = g_panelVisible && g_gameHwnd && (GetForegroundWindow() == g_gameHwnd);
+        const bool gameFocused = g_gameHwnd && (GetForegroundWindow() == g_gameHwnd);
         const bool overPanel = gameFocused &&
                                (UiPointOverPanel(ms->pt.x, ms->pt.y) ||
                                 InterlockedCompareExchange(&g_hasActivePopupOrDrag, 0, 0) != 0);
@@ -772,44 +776,49 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             break;
         }
     }
+    else
+    {
+        // 面板隐藏时若之前吞过 DOWN，仍成对放行/清零状态防止卡键
+        if (wParam == WM_LBUTTONUP) {
+            InterlockedExchange(&g_llMouseDown[0], 0);
+            if (InterlockedExchange(&g_llSwallowed[0], 0) != 0) return 1;
+        } else if (wParam == WM_RBUTTONUP) {
+            InterlockedExchange(&g_llMouseDown[1], 0);
+            if (InterlockedExchange(&g_llSwallowed[1], 0) != 0) return 1;
+        } else if (wParam == WM_MBUTTONUP) {
+            InterlockedExchange(&g_llMouseDown[2], 0);
+            if (InterlockedExchange(&g_llSwallowed[2], 0) != 0) return 1;
+        }
+    }
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 }
 
-// 钩子线程：装钩子 + 跑消息循环。
-//
-// ★ 为什么必须单独开线程 pump 消息：
-//   WH_MOUSE_LL 的回调由系统投递到 **调用 SetWindowsHookEx 的那个线程的消息队列**，
-//   要求该线程持续 GetMessage/PeekMessage。而本工程的 Worker 线程是 `for(;;) Sleep(1000)`
-//   —— **从不 pump 消息**，若直接在它上面装钩子，回调永远不会触发（且可能被系统摘掉）。
-//   所以这里专门 CreateThread 一个只做 GetMessage 的线程来拥有钩子。
+// 钩子线程：装钩子 + 跑事件驱动消息循环（GetMessageW 零延迟唤醒，替代 Sleep(4) 轮询）。
 static DWORD WINAPI MouseHookThread(LPVOID)
 {
-    g_mouseHookThreadId = (LONG)GetCurrentThreadId();
-    // ★ dwThreadId 必须传 0！低级钩子（WH_MOUSE_LL/WH_KEYBOARD_LL）是 **global-only**，
-    //   传具体线程 id 会让 SetWindowsHookEx 失败并返回 1429
-    //   （ERROR_GLOBAL_ONLY_HOOK，"此挂接程序只可整体设置"）——这就是最初滚轮装不上的原因。
-    //   hMod 传 NULL 是允许的（LL 钩子的回调可以放在当前进程代码里，不要求是 DLL）。
+    const DWORD tid = GetCurrentThreadId();
+    // 先创建线程消息队列，确保卸载时 PostThreadMessageW(WM_QUIT) 必能送达
+    MSG initMsg;
+    PeekMessageW(&initMsg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    InterlockedExchange(&g_mouseHookThreadId, (LONG)tid);
+
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, nullptr, 0);
     if (!g_mouseHook)
     {
         LogUi("[ui] 安装 WH_MOUSE_LL 失败 (GetLastError=%lu) —— 滚轮退回 PgUp/PgDn",
               GetLastError());
-        g_mouseHookThreadId = 0;
+        InterlockedExchange(&g_mouseHookThreadId, 0);
         return 0;
     }
-    LogUi("[ui] WH_MOUSE_LL 已安装（pump tid=%ld）—— 真鼠标滚轮可用", (long)g_mouseHookThreadId);
+    LogUi("[ui] WH_MOUSE_LL 已安装（event-driven GetMessage pump tid=%lu）—— 零延迟滚轮与防穿透可用", (unsigned long)tid);
 
-    // 消息泵：直到要求停止。
     MSG msg;
     while (!g_mouseHookStop)
     {
-        // PeekMessage 非阻塞，避免无消息时卡在 GetMessage 里导致停不掉
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
-        {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        Sleep(4);   // 4ms 轮询：滚轮事件延迟可忽略，又不至于空转烧 CPU
+        BOOL gm = GetMessageW(&msg, nullptr, 0, 0);
+        if (gm <= 0) break; // WM_QUIT 或错误 -> 立即退出
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
 
     if (g_mouseHook)
@@ -818,7 +827,7 @@ static DWORD WINAPI MouseHookThread(LPVOID)
         g_mouseHook = nullptr;
         LogUi("[ui] WH_MOUSE_LL 已卸载");
     }
-    g_mouseHookThreadId = 0;
+    InterlockedExchange(&g_mouseHookThreadId, 0);
     return 0;
 }
 
@@ -840,7 +849,10 @@ static bool InstallMouseWheelHook()
 static void UninstallMouseWheelHook()
 {
     if (!g_mouseHookThread) return;
-    g_mouseHookStop = 1;
+    InterlockedExchange(&g_mouseHookStop, 1);
+    LONG tid = InterlockedCompareExchange(&g_mouseHookThreadId, 0, 0);
+    if (tid != 0)
+        PostThreadMessageW((DWORD)tid, WM_QUIT, 0, 0);
     WaitForSingleObject(g_mouseHookThread, 1000);   // 等 pump 线程自行卸钩子退出
     CloseHandle(g_mouseHookThread);
     g_mouseHookThread = nullptr;
